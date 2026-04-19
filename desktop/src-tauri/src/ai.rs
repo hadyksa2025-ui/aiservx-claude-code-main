@@ -805,7 +805,7 @@ pub(crate) async fn run_chat_turn(
     state.cancelled.reset();
     let cancel = turn_cancel_token(state);
 
-    let settings = state.settings.lock().unwrap().clone();
+    let settings = state.settings.read().unwrap().clone();
     let use_planner = !settings.openrouter_api_key.is_empty();
     let max_iterations = (settings.max_iterations as usize).min(MAX_ITERATIONS_CEILING);
     let schema = tools::tool_schema();

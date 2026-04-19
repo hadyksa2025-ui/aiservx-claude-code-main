@@ -150,7 +150,7 @@ pub async fn start_goal(
         }),
     );
 
-    let settings = state.settings.lock().unwrap().clone();
+    let settings = state.settings.read().unwrap().clone();
     let max_total = settings.max_total_tasks.max(1) as usize;
     let goal_timeout_secs = settings.goal_timeout_secs;
 
@@ -935,7 +935,7 @@ async fn review_task(
     task_desc: &str,
     executor_summary: &str,
 ) -> ReviewDecision {
-    let reviewer_enabled = state.settings.lock().unwrap().reviewer_enabled;
+    let reviewer_enabled = state.settings.read().unwrap().reviewer_enabled;
     if !reviewer_enabled || executor_summary.trim().is_empty() {
         return ReviewDecision::Unknown(executor_summary.into());
     }
@@ -1008,5 +1008,47 @@ mod tests {
         let s = "```json\n{\"tasks\":[{\"description\":\"do x\"},{\"description\":\"do y\"}]}\n```";
         let tasks = parse_plan_json(s).unwrap();
         assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_handles_thinking_prefix_before_json() {
+        // Models that emit reasoning text before the JSON object should
+        // still parse correctly via balanced bracket extraction.
+        let s = r#"Let me think about this...
+The project needs these steps:
+{"tasks":[{"description":"step one"},{"description":"step two"}]}
+That should do it."#;
+        let tasks = parse_plan_json(s).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].description, "step one");
+    }
+
+    #[test]
+    fn parse_plan_handles_two_json_objects() {
+        // A model that emits a thinking JSON blob followed by the real
+        // plan. The old `rfind('}')` approach would concatenate both
+        // into an invalid string.
+        let s = r#"{"thinking": "hmm"} ok here is the plan: {"tasks":[{"description":"do x"}]}"#;
+        // extract_first_balanced_json picks the first object, which is
+        // the thinking blob — it won't parse as PlanJson. But the
+        // function should still return None gracefully (not panic).
+        // In practice the retry logic will handle this.
+        let result = parse_plan_json(s);
+        // The first balanced object is {"thinking":"hmm"} which lacks
+        // a "tasks" field, so parse fails.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_balanced_json_handles_nested_braces_and_strings() {
+        let s = r#"prefix {"outer": {"inner": "val with } brace"}} suffix"#;
+        let extracted = extract_first_balanced_json(s).unwrap();
+        assert_eq!(extracted, r#"{"outer": {"inner": "val with } brace"}}"#);
+    }
+
+    #[test]
+    fn extract_balanced_json_returns_none_for_unbalanced() {
+        assert!(extract_first_balanced_json("no braces here").is_none());
+        assert!(extract_first_balanced_json("{unclosed").is_none());
     }
 }

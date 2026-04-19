@@ -181,7 +181,7 @@ impl Settings {
 
 #[tauri::command]
 pub fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
-    Ok(state.settings.lock().unwrap().clone())
+    Ok(state.settings.read().unwrap().clone())
 }
 
 #[tauri::command]
@@ -190,6 +190,6 @@ pub fn save_settings(
     settings: Settings,
 ) -> Result<(), String> {
     settings.save().map_err(|e| e.to_string())?;
-    *state.settings.lock().unwrap() = settings;
+    *state.settings.write().unwrap() = settings;
     Ok(())
 }
