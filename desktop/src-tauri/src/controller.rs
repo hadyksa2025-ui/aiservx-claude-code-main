@@ -443,7 +443,14 @@ async fn execute_task_with_retries(
         // Build a per-task message that includes goal context and any
         // reviewer feedback from a prior attempt.
         let snapshot = tree.tasks[idx].clone();
-        let context = build_task_message(goal, total, idx, &snapshot, last_feedback.as_deref());
+        // Collect completed prior tasks so the executor knows what was
+        // already accomplished (solves inter-task context loss).
+        let prior_tasks: Vec<Task> = tree.tasks[..idx]
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done.as_str())
+            .cloned()
+            .collect();
+        let context = build_task_message(goal, total, idx, &snapshot, last_feedback.as_deref(), &prior_tasks);
 
         // Run the multi-agent loop for this task, bounded by task_timeout.
         let fut = ai::run_chat_turn(
@@ -626,6 +633,7 @@ fn build_task_message(
     idx: usize,
     task: &Task,
     feedback: Option<&str>,
+    prior_tasks: &[Task],
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -633,6 +641,37 @@ fn build_task_message(
         idx + 1,
         total
     ));
+    // Inject a brief summary of what prior tasks accomplished so the
+    // executor has context continuity without needing to rediscover
+    // everything from the filesystem. Capped at 500 chars total.
+    if !prior_tasks.is_empty() {
+        s.push_str("COMPLETED TASKS SO FAR:\n");
+        let mut budget = 500usize;
+        for (i, pt) in prior_tasks.iter().enumerate() {
+            if budget == 0 {
+                break;
+            }
+            let result_text = pt.result.as_deref().unwrap_or("(no summary)");
+            let line = format!(
+                "  {}. {} → {}\n",
+                i + 1,
+                pt.description,
+                result_text
+            );
+            let chars: usize = line.chars().count();
+            if chars > budget {
+                // Truncate the last line to fit.
+                let truncated: String = line.chars().take(budget).collect();
+                s.push_str(&truncated);
+                s.push_str("…\n");
+                budget = 0;
+            } else {
+                s.push_str(&line);
+                budget = budget.saturating_sub(chars);
+            }
+        }
+        s.push('\n');
+    }
     s.push_str(&format!("CURRENT TASK: {}\n\n", task.description));
     if let Some(fb) = feedback {
         s.push_str(&format!(
@@ -683,25 +722,49 @@ async fn plan_goal(
         app.clone(),
         state,
         project_dir.to_string(),
-        full,
+        full.clone(),
         Vec::<UiMessage>::new(),
         false,
     )
     .await?;
     let text = resp.assistant.trim().to_string();
-    parse_plan_json(&text).ok_or_else(|| format!("planner did not return valid JSON: {text}"))
+    if let Some(tasks) = parse_plan_json(&text) {
+        return Ok(tasks);
+    }
+
+    // JSON repair/retry: small local models frequently wrap JSON in prose
+    // or markdown. Retry once with an explicit reprompt.
+    warn!("plan_goal: first attempt did not return valid JSON, retrying with reprompt");
+    let reprompt = format!(
+        "{full}\n\n\
+         Your previous response was not valid JSON. Return ONLY a JSON object \
+         with a \"tasks\" array. No markdown, no prose, no explanation — just \
+         the raw JSON object."
+    );
+    let retry_resp = ai::run_chat_turn(
+        app.clone(),
+        state,
+        project_dir.to_string(),
+        reprompt,
+        Vec::<UiMessage>::new(),
+        false,
+    )
+    .await?;
+    let retry_text = retry_resp.assistant.trim().to_string();
+    parse_plan_json(&retry_text)
+        .ok_or_else(|| format!("planner did not return valid JSON after retry: {retry_text}"))
 }
 
 fn parse_plan_json(s: &str) -> Option<Vec<PlanTask>> {
     // Accept either a raw JSON object, a ```json block, or a leading/
     // trailing blurb around a JSON object.
     let stripped = strip_code_fences(s);
-    let start = stripped.find('{')?;
-    let end = stripped.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    let slice = &stripped[start..=end];
+    // Find the first balanced JSON object via bracket counting instead
+    // of slicing from first '{' to last '}'. This handles models that
+    // emit thinking/reasoning text followed by the actual JSON — the
+    // old `rfind('}')` approach would concatenate both blobs into an
+    // invalid string.
+    let slice = extract_first_balanced_json(&stripped)?;
     let parsed: PlanJson = serde_json::from_str(slice).ok()?;
     let tasks: Vec<PlanTask> = parsed
         .tasks
@@ -712,6 +775,41 @@ fn parse_plan_json(s: &str) -> Option<Vec<PlanTask>> {
         return None;
     }
     Some(tasks)
+}
+
+/// Extract the first balanced `{ … }` substring from `s` using bracket
+/// counting. Returns `None` if no balanced object is found.
+fn extract_first_balanced_json(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => {
+                escape_next = true;
+            }
+            b'"' => {
+                in_string = !in_string;
+            }
+            b'{' if !in_string => {
+                depth += 1;
+            }
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn strip_code_fences(s: &str) -> String {

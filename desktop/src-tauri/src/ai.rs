@@ -256,6 +256,12 @@ impl WireMessage {
     }
 }
 
+/// Maximum number of recent user/assistant history turns to keep when
+/// building executor messages. System messages are always preserved.
+/// This prevents context-window overflow on long sessions while keeping
+/// the most recent conversation context available to the executor.
+const MAX_HISTORY_TURNS: usize = 20;
+
 fn build_executor_messages(
     history: &[UiMessage],
     user: &str,
@@ -276,11 +282,23 @@ fn build_executor_messages(
             )));
         }
     }
-    for m in history {
+    // Sliding window: keep system messages (already added above) plus
+    // the last MAX_HISTORY_TURNS user/assistant messages. This prevents
+    // context-window overflow on long sessions (50+ messages) while
+    // preserving the most recent conversation context.
+    let non_system: Vec<&UiMessage> = history
+        .iter()
+        .filter(|m| m.role != "system")
+        .collect();
+    let skip = non_system.len().saturating_sub(MAX_HISTORY_TURNS);
+    // Always include system messages from history.
+    for m in history.iter().filter(|m| m.role == "system") {
+        msgs.push(WireMessage::system(&m.content));
+    }
+    for m in non_system.into_iter().skip(skip) {
         match m.role.as_str() {
             "user" => msgs.push(WireMessage::user(&m.content)),
             "assistant" => msgs.push(WireMessage::assistant(&m.content, None)),
-            "system" => msgs.push(WireMessage::system(&m.content)),
             _ => {}
         }
     }
@@ -570,7 +588,9 @@ async fn stream_ollama(
     Ok(acc.finalize())
 }
 
-/// Attempt the planner first; fall back to Ollama on any error.
+/// Try the executor via Ollama first; if Ollama fails and an OpenRouter
+/// API key is configured, fall back to OpenRouter so the task doesn't
+/// fail immediately when the local model is down.
 async fn call_executor_with_fallback(
     app: &AppHandle,
     settings: &Settings,
@@ -579,21 +599,43 @@ async fn call_executor_with_fallback(
     role: Role,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
-    // Executor path is always Ollama for now.
-    stream_ollama(app, settings, messages, Some(tools_schema), role, cancel).await
+    match stream_ollama(app, settings, messages, Some(tools_schema), role, cancel).await {
+        Ok(msg) => Ok(msg),
+        Err(ollama_err) => {
+            // Only attempt fallback when an OpenRouter key is available.
+            if settings.openrouter_api_key.is_empty() {
+                return Err(ollama_err);
+            }
+            warn!("executor failed on Ollama, falling back to OpenRouter: {ollama_err}");
+            let _ = app.emit(
+                "ai:error",
+                json!({
+                    "message": format!("Ollama failed ({ollama_err}), trying OpenRouter…"),
+                    "role": role.as_str(),
+                }),
+            );
+            stream_openrouter(app, settings, None, messages, Some(tools_schema), role, cancel)
+                .await
+                .map_err(|or_err| {
+                    format!(
+                        "both providers failed — Ollama: {ollama_err}; OpenRouter: {or_err}"
+                    )
+                })
+        }
+    }
 }
 
 // ---------- Top-level commands ----------
 
 #[tauri::command]
 pub async fn check_planner(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let key = state.settings.lock().unwrap().openrouter_api_key.clone();
+    let key = state.settings.read().unwrap().openrouter_api_key.clone();
     Ok(!key.is_empty())
 }
 
 #[tauri::command]
 pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let base = state.settings.lock().unwrap().ollama_base_url.clone();
+    let base = state.settings.read().unwrap().ollama_base_url.clone();
     let url = format!("{}/api/tags", base.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -979,7 +1021,7 @@ pub(crate) async fn run_chat_turn(
             break 'outer;
         }
         emit_step(&app, &mut steps, Role::Reviewer, "reviewing", "running");
-        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls, project_ctx_ref);
+        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls, &all_tool_results, project_ctx_ref);
         // Reviewer prefers the planner (OpenRouter) if available, else executor.
         let review_result = if use_planner {
             stream_openrouter(&app, &settings, None, &review_messages, None, Role::Reviewer, &cancel).await
@@ -1094,19 +1136,35 @@ fn reviewer_messages(
     user: &str,
     assistant: &str,
     calls: &[UiToolCall],
+    results: &[UiToolResult],
     project_ctx: Option<&str>,
 ) -> Vec<WireMessage> {
     let tool_summary = if calls.is_empty() {
         "(no tools were called)".to_string()
     } else {
+        // Build a compact transcript of tool calls WITH their results so
+        // the reviewer can verify what the executor actually *did*, not
+        // just what it *said* it did. Each result is capped at 200 chars
+        // to keep the reviewer context manageable.
         calls
             .iter()
-            .map(|c| format!("- {} {}", c.name, args_preview(&c.args)))
+            .map(|c| {
+                let result_line = results
+                    .iter()
+                    .find(|r| r.id == c.id)
+                    .map(|r| {
+                        let status = if r.ok { "✓" } else { "✗" };
+                        let output = truncate(&r.output, 200);
+                        format!("  → {status} {output}")
+                    })
+                    .unwrap_or_else(|| "  → (no result)".to_string());
+                format!("- {} {}\n{}", c.name, args_preview(&c.args), result_line)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
     let transcript = format!(
-        "User request:\n{user}\n\nExecutor tool calls:\n{tool_summary}\n\nExecutor summary:\n{assistant}\n"
+        "User request:\n{user}\n\nExecutor tool calls and results:\n{tool_summary}\n\nExecutor summary:\n{assistant}\n"
     );
     let mut msgs: Vec<WireMessage> = Vec::with_capacity(3);
     msgs.push(WireMessage::system(REVIEWER_PROMPT));

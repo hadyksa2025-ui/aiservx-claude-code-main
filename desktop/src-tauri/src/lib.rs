@@ -12,7 +12,7 @@
 //! `src/` is a read-only research snapshot and is intentionally out of scope.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use tauri::Manager;
 use tokio::sync::oneshot;
@@ -36,7 +36,9 @@ pub(crate) use settings::Settings;
 /// Shared, mutable application state, owned by Tauri.
 pub struct AppState {
     /// Active settings (loaded from / persisted to the app config dir).
-    pub settings: Mutex<Settings>,
+    /// `RwLock` because reads are frequent (every chat turn, health check,
+    /// tool call) but writes are rare (only when the user saves settings).
+    pub settings: RwLock<Settings>,
     /// Running directory watchers, keyed by project root.
     pub watchers: watcher::Watchers,
     /// Cancellation token shared by in-flight chat loops. Cooperative
@@ -77,7 +79,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            settings: Mutex::new(initial_settings),
+            settings: RwLock::new(initial_settings),
             watchers: watcher::Watchers::default(),
             cancelled: cancel::CancelToken::new(),
             goal_cancelled: cancel::CancelToken::new(),
