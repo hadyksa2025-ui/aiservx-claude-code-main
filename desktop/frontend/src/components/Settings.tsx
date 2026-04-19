@@ -77,6 +77,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     })();
   }, []);
 
+  // Reset the probe result whenever the tested inputs change. Without this
+  // the UI would render a stale green/yellow/red status against the *current*
+  // form value for ollama_model/ollama_base_url, even though the probe was
+  // computed against the previous values — e.g. showing "✓ model foo
+  // available" after the user has just typed a completely different model.
+  useEffect(() => {
+    setProbe({ kind: "idle" });
+  }, [s.ollama_base_url, s.ollama_model]);
+
   const save = async () => {
     setSaving(true);
     try {
