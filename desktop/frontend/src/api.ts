@@ -6,8 +6,10 @@ import type {
   ConfirmRequest,
   FsChange,
   FsEntry,
+  ProjectMap,
   Settings,
   StepEvent,
+  TaskTree,
   ToolCall,
   ToolResult,
 } from "./types";
@@ -63,6 +65,28 @@ export const api = {
   /** Resolve a pending `ai:confirm_request` (run_cmd safety gate). */
   confirmCmd: (id: string, approved: boolean) =>
     invoke<void>("confirm_cmd", { id, approved }),
+
+  /** Start the autonomous task engine on a high-level user goal. */
+  startGoal: (
+    project_dir: string,
+    goal: string,
+  ): Promise<{
+    goal_id: string;
+    status: string;
+    completed: number;
+    failed: number;
+  }> => invoke("start_goal", { projectDir: project_dir, goal }),
+
+  /** Cooperatively cancel the top-level goal loop. */
+  cancelGoal: () => invoke<void>("cancel_goal"),
+
+  /** Scan the opened project and persist the resulting project_map. */
+  scanProject: (project_dir: string) =>
+    invoke<ProjectMap>("scan_project_cmd", { projectDir: project_dir }),
+
+  /** Load the most-recently-persisted active task tree, if any. */
+  loadTaskTree: (project_dir: string) =>
+    invoke<TaskTree | null>("load_task_tree", { projectDir: project_dir }),
 };
 
 export type BackendEvent =
@@ -73,7 +97,13 @@ export type BackendEvent =
   | "ai:done"
   | "ai:error"
   | "ai:confirm_request"
-  | "fs:changed";
+  | "fs:changed"
+  | "task:goal_started"
+  | "task:added"
+  | "task:update"
+  | "task:goal_done"
+  | "task:failure_logged"
+  | "project:scan_done";
 
 /** Listen to a backend event. Returns an unlisten function. */
 export async function onEvent<T>(

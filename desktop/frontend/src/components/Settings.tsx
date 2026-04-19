@@ -11,6 +11,9 @@ const DEFAULTS: Settings = {
   max_iterations: 8,
   cmd_confirm_required: true,
   cmd_allow_list: [],
+  autonomous_mode: false,
+  max_retries_per_task: 3,
+  max_total_tasks: 20,
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
@@ -40,6 +43,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       const normalized: Settings = {
         ...s,
         max_iterations: Math.max(1, Math.min(16, Number(s.max_iterations) || 8)),
+        max_retries_per_task: Math.max(
+          0,
+          Math.min(10, Number(s.max_retries_per_task) || 3),
+        ),
+        max_total_tasks: Math.max(
+          1,
+          Math.min(100, Number(s.max_total_tasks) || 20),
+        ),
         cmd_allow_list: allowListText
           .split("\n")
           .map((l) => l.trim())
@@ -105,6 +116,45 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             value={s.max_iterations}
             onChange={(e) =>
               setS({ ...s, max_iterations: Number(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={s.autonomous_mode}
+              onChange={(e) =>
+                setS({ ...s, autonomous_mode: e.target.checked })
+              }
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Autonomous mode (goal loop runs without per-task confirmation)
+          </label>
+        </div>
+
+        <div className="row">
+          <label>Max retries per task (0–10)</label>
+          <input
+            type="number"
+            min={0}
+            max={10}
+            value={s.max_retries_per_task}
+            onChange={(e) =>
+              setS({ ...s, max_retries_per_task: Number(e.target.value) })
+            }
+          />
+        </div>
+        <div className="row">
+          <label>Max total tasks per goal (1–100)</label>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={s.max_total_tasks}
+            onChange={(e) =>
+              setS({ ...s, max_total_tasks: Number(e.target.value) })
             }
           />
         </div>

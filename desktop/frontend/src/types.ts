@@ -48,6 +48,71 @@ export type Settings = {
   max_iterations: number;
   cmd_confirm_required: boolean;
   cmd_allow_list: string[];
+  autonomous_mode: boolean;
+  max_retries_per_task: number;
+  max_total_tasks: number;
+};
+
+export type TaskStatus = "pending" | "running" | "done" | "failed" | "skipped";
+
+export type Task = {
+  id: string;
+  description: string;
+  status: TaskStatus;
+  retries: number;
+  deps: string[];
+  result: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type TaskTree = {
+  id: string;
+  goal: string;
+  tasks: Task[];
+  created_at: number;
+  updated_at: number;
+  status: "running" | "done" | "failed" | "cancelled";
+};
+
+export type ProjectMap = {
+  root: string;
+  scanned_at: number;
+  languages: string[];
+  entry_points: string[];
+  configs: string[];
+  dependencies: string[];
+  file_count: number;
+};
+
+export type TaskGoalStarted = {
+  id: string;
+  goal: string;
+  task_count: number;
+  created_at: number;
+};
+
+export type TaskAddedEvent = {
+  goal_id: string;
+  task: Task;
+};
+
+export type TaskUpdateEvent = {
+  goal_id: string;
+  id: string;
+  status: TaskStatus;
+  retries?: number;
+  result?: string | null;
+  updated_at?: number;
+  retries_bumped?: boolean;
+};
+
+export type TaskGoalDoneEvent = {
+  id: string;
+  goal: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  completed: number;
+  failed: number;
 };
 
 export type StepStatus = "running" | "done" | "failed";

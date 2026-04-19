@@ -107,6 +107,12 @@ user prompt
 | 15 | Richer memory: file_index, decisions, tool_usage     | done        |
 | 16 | UI depth: streaming renderer, inline diff, timeline  | done        |
 | 17 | `run_cmd` safety: deny/allow-list + confirm dialog   | done        |
+| 18 | Autonomous Task Engine: task tree + controller loop  | done        |
+| 19 | Project scanner: languages/entry-points/configs/deps | done        |
+| 20 | Multi-level memory: active_task_tree, task_history,  | done        |
+|    |   failures_log, project_map                          |             |
+| 21 | Intelligent retry per task (configurable, reviewer)  | done        |
+| 22 | UI task panel + autonomous-mode toggle               | done        |
 
 ### 3.1 Blockers
 
@@ -126,7 +132,41 @@ user prompt
   (file_index, decisions, tool_usage), shell-cmd deny/allow-list + UI
   confirmation modal, and a step timeline / agent-role chips / inline
   diff renderer in the Execution pane.
+- **PR #3** — autonomous task engine: new modules `tasks.rs`,
+  `project_scan.rs`, `controller.rs`; new Tauri commands `start_goal`,
+  `cancel_goal`, `scan_project_cmd`, `load_task_tree`; goal-level cancel
+  flag on `AppState`; per-task retries driven by the reviewer; extended
+  memory with `active_task_tree`, `task_history`, `failures_log`,
+  `project_map`; new Task panel, autonomous-mode toggle + retry/total
+  caps in Settings.
 - Extraction-from-`src/` PR: **awaiting authorization proof**.
+
+## 3.6 Autonomous Task Engine (PR #3)
+
+- `controller::start_goal(project_dir, goal)` is the new top-level
+  command. It (1) scans the project and persists a `project_map`,
+  (2) asks the planner for a JSON task list (capped by
+  `settings.max_total_tasks`), (3) runs each task through
+  `ai::run_chat_turn` with a goal-aware wrapper prompt, (4) consults the
+  reviewer for an `OK:` / `NEEDS_FIX:` verdict, (5) retries up to
+  `settings.max_retries_per_task` times with the reviewer's instruction
+  fed back as feedback, and (6) archives the completed tree into
+  `task_history[]`.
+- `AppState.goal_cancelled` is a separate flag from `cancelled` so that
+  in-flight chat turns can be cancelled without killing the whole goal,
+  and a goal can be stopped without surprising the next chat turn.
+- Events emitted for the UI:
+  - `project:scan_done` — `{ languages, entry_points, configs, deps, file_count }`
+  - `task:goal_started` — `{ id, goal, task_count }`
+  - `task:added`        — `{ goal_id, task }`
+  - `task:update`       — `{ goal_id, id, status, retries?, result? }`
+  - `task:goal_done`    — `{ id, goal, status, completed, failed }`
+  - `task:failure_logged` — `{ task_id, error }`
+- PROJECT_MEMORY.json gets four new top-level slots:
+  - `active_task_tree` — the in-flight tree (null once a goal finishes).
+  - `task_history[]`   — completed / failed / cancelled trees (cap 200).
+  - `failures_log[]`   — `{ at, task_id, error }` entries (cap 200).
+  - `project_map`      — latest scanner snapshot.
 
 ## 4. Design Decisions
 

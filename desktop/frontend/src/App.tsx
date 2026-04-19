@@ -15,6 +15,7 @@ import { Chat } from "./components/Chat";
 import { Execution } from "./components/Execution";
 import { SettingsModal } from "./components/Settings";
 import { ConfirmCmdOverlay } from "./components/ConfirmCmd";
+import { TaskPanel } from "./components/TaskPanel";
 
 export default function App() {
   const [projectDir, setProjectDir] = useState<string | null>(null);
@@ -170,7 +171,7 @@ export default function App() {
         <button onClick={() => setSettingsOpen(true)}>Settings</button>
       </div>
 
-      <div className="panes">
+      <div className="panes panes-4">
         <div className="pane">
           <div className="pane-header">Explorer</div>
           <div className="pane-body">
@@ -181,6 +182,16 @@ export default function App() {
                 Open a project folder to see its files.
               </div>
             )}
+          </div>
+        </div>
+
+        <div className="pane">
+          <div className="pane-header">Goal &amp; Tasks</div>
+          <div className="pane-body">
+            <TaskPanel
+              projectDir={projectDir}
+              disabled={!projectDir || executorOk === false}
+            />
           </div>
         </div>
 

@@ -48,7 +48,11 @@
     { "name": "load_memory",    "description": "Load PROJECT_MEMORY.json from the opened project root." },
     { "name": "save_memory",    "description": "Save PROJECT_MEMORY.json into the opened project root." },
     { "name": "check_planner",  "description": "Health check: OpenRouter reachable with a key." },
-    { "name": "check_executor", "description": "Health check: Ollama reachable." }
+    { "name": "check_executor", "description": "Health check: Ollama reachable." },
+    { "name": "start_goal",       "description": "Autonomous: plan goal -> run tasks sequentially -> review/retry -> archive." },
+    { "name": "cancel_goal",      "description": "Cooperatively cancel the top-level autonomous goal loop." },
+    { "name": "scan_project_cmd", "description": "Scan the project (languages, entry points, configs, deps) and persist project_map." },
+    { "name": "load_task_tree",   "description": "Load the most-recently-persisted active task tree from PROJECT_MEMORY.json." }
   ],
   "tool_schema": [
     {
@@ -102,12 +106,22 @@
     { "name": "ai:confirm_request",  "payload": { "id": "string", "cmd": "string", "project_dir": "string", "timeout_ms": "number" } },
     { "name": "ai:done",             "payload": { "assistant": "string", "iterations": "number" } },
     { "name": "ai:error",            "payload": { "message": "string", "role": "planner|executor|reviewer|null" } },
-    { "name": "fs:changed",          "payload": { "path": "string", "kind": "created|modified|removed|renamed" } }
+    { "name": "fs:changed",          "payload": { "path": "string", "kind": "created|modified|removed|renamed" } },
+    { "name": "project:scan_done",   "payload": { "languages": "string[]", "entry_points": "string[]", "configs": "string[]", "dependencies": "string[]", "file_count": "number" } },
+    { "name": "task:goal_started",   "payload": { "id": "string", "goal": "string", "task_count": "number", "created_at": "number" } },
+    { "name": "task:added",          "payload": { "goal_id": "string", "task": "Task" } },
+    { "name": "task:update",         "payload": { "goal_id": "string", "id": "string", "status": "pending|running|done|failed|skipped", "retries?": "number", "result?": "string|null", "updated_at?": "number", "retries_bumped?": "boolean" } },
+    { "name": "task:goal_done",      "payload": { "id": "string", "goal": "string", "status": "running|done|failed|cancelled", "completed": "number", "failed": "number" } },
+    { "name": "task:failure_logged", "payload": { "task_id": "string", "error": "string" } }
   ],
   "session": {
     "turns": [],
     "opened_project": null
   },
+  "active_task_tree": null,
+  "task_history": [],
+  "failures_log": [],
+  "project_map": null,
   "delivery_status": {
     "pr_1": {
       "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1",
@@ -123,9 +137,9 @@
       ]
     },
     "pr_2": {
-      "url": null,
+      "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/2",
       "title": "desktop: streaming + reviewer agent + cmd safety + richer memory",
-      "state": "pending-push",
+      "state": "merged",
       "includes": [
         "Real SSE streaming from OpenRouter and Ollama (ai:token with role)",
         "Three-agent loop: Planner -> Executor (bounded iterations) -> Reviewer (1 corrective NEEDS_FIX retry)",
@@ -134,6 +148,21 @@
         "Richer memory: session turns, tool_usage counters, file_index (bounded 500), decisions (bounded 100)",
         "UI: streaming chat bubbles per role, role chips, step timeline, inline colored diffs, confirm modal",
         "Settings UI: reviewer toggle, max_iterations, cmd_confirm_required, cmd_allow_list editor"
+      ]
+    },
+    "pr_3": {
+      "url": null,
+      "title": "desktop: autonomous task engine — goal planner, controller, project scanner, task UI",
+      "state": "pending-push",
+      "includes": [
+        "New backend modules: tasks.rs (TaskTree schema + persistence), project_scan.rs (language/entry-point/config/deps detection), controller.rs (goal -> plan -> execute -> review -> retry loop)",
+        "New Tauri commands: start_goal, cancel_goal, scan_project_cmd, load_task_tree",
+        "AppState.goal_cancelled: separate flag from per-turn cancel",
+        "Settings: autonomous_mode, max_retries_per_task (default 3), max_total_tasks (default 20)",
+        "PROJECT_MEMORY.json: active_task_tree, task_history (cap 200), failures_log (cap 200), project_map",
+        "ai::run_chat_turn: reusable multi-agent turn exposed to the controller",
+        "Events: project:scan_done, task:goal_started, task:added, task:update, task:goal_done, task:failure_logged",
+        "Frontend: new TaskPanel component (goal input, task list w/ status chips, progress bar, retries, result), 4-pane layout, autonomous-mode toggle + retry/total caps in Settings"
       ]
     },
     "blockers": [

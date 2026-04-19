@@ -144,6 +144,9 @@ textarea:focus {
   height: 100%;
   overflow: hidden;
 }
+.panes-4 {
+  grid-template-columns: 240px 320px 1fr 360px;
+}
 
 .pane {
   display: flex;
@@ -505,4 +508,190 @@ textarea:focus {
   color: var(--warn);
   max-height: 180px;
   overflow: auto;
+}
+
+/* ---------- Task panel (autonomous engine) ---------- */
+
+.task-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  min-height: 0;
+  font-size: 12px;
+}
+
+.task-goal-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.task-goal-input {
+  width: 100%;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.task-goal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.task-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.task-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.task-tree-goal {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--fg);
+  line-height: 1.3;
+}
+.task-summary {
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+.task-status-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border: 1px solid var(--border);
+}
+.task-status-chip.task-status-running { background: #1d3557; color: #9ecbff; border-color: #315585; }
+.task-status-chip.task-status-done    { background: #1b3b26; color: #a4e8b2; border-color: #2f6b47; }
+.task-status-chip.task-status-failed  { background: #4a1f1f; color: #ff9b9b; border-color: #803131; }
+.task-status-chip.task-status-cancelled,
+.task-status-chip.task-status-idle    { background: var(--bg-3); color: var(--fg-dim); }
+
+.task-progress {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.task-progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--bg-3);
+  border-radius: 2px;
+  overflow: hidden;
+  min-width: 60px;
+}
+.task-progress-fill {
+  height: 100%;
+  background: #3fb950;
+  transition: width 0.2s ease;
+}
+
+.task-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: none;
+}
+
+.task-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+}
+.task-row-running { border-color: #315585; background: rgba(29, 53, 87, 0.35); }
+.task-row-done    { opacity: 0.75; }
+.task-row-failed  { border-color: #803131; background: rgba(74, 31, 31, 0.25); }
+
+.task-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 5px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+.task-dot-pending { background: var(--border); }
+.task-dot-running { background: #9ecbff; box-shadow: 0 0 6px #3a6fb0; }
+.task-dot-done    { background: #3fb950; }
+.task-dot-failed  { background: #ff7676; }
+.task-dot-skipped { background: #aaa; }
+
+.task-index {
+  font-family: var(--mono);
+  color: var(--fg-dim);
+  font-size: 11px;
+  flex-shrink: 0;
+  min-width: 20px;
+}
+.task-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.task-desc {
+  line-height: 1.35;
+  color: var(--fg);
+  word-break: break-word;
+}
+.task-retries {
+  font-size: 10px;
+  color: #f0b67f;
+  font-family: var(--mono);
+}
+.task-result {
+  font-size: 11px;
+  color: var(--fg-dim);
+  line-height: 1.3;
+  padding: 4px 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  border-left: 2px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.task-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 3px;
+  align-self: flex-start;
+  flex-shrink: 0;
+  letter-spacing: 0.04em;
+}
+.task-badge-pending  { background: var(--bg-3); color: var(--fg-dim); }
+.task-badge-running  { background: #1d3557; color: #9ecbff; }
+.task-badge-done     { background: #1b3b26; color: #a4e8b2; }
+.task-badge-failed   { background: #4a1f1f; color: #ff9b9b; }
+.task-badge-skipped  { background: var(--bg-3); color: var(--fg-dim); }
+
+.task-empty {
+  color: var(--fg-dim);
+  font-style: italic;
+  padding: 6px 8px;
 }

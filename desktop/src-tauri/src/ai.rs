@@ -553,6 +553,19 @@ pub async fn send_chat(
     message: String,
     history: Vec<UiMessage>,
 ) -> Result<ChatResponse, String> {
+    run_chat_turn(app, &state, project_dir, message, history).await
+}
+
+/// Runs a single multi-agent chat turn. Reusable by the higher-level
+/// autonomous controller (`controller::start_goal`), which does not own
+/// a `tauri::State` handle but does hold `&AppState`.
+pub(crate) async fn run_chat_turn(
+    app: AppHandle,
+    state: &AppState,
+    project_dir: String,
+    message: String,
+    history: Vec<UiMessage>,
+) -> Result<ChatResponse, String> {
     *state.cancelled.lock().unwrap() = false;
 
     let settings = state.settings.lock().unwrap().clone();
@@ -670,7 +683,7 @@ pub async fn send_chat(
 
                 let exec_result = match tc.function.name.as_str() {
                     "run_cmd" => {
-                        tools::execute_run_cmd_gated(&app, &state, &project_dir, &args).await
+                        tools::execute_run_cmd_gated(&app, state, &project_dir, &args).await
                     }
                     other => tools::execute_safe(&project_dir, other, &args).await,
                 };

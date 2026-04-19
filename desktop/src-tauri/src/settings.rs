@@ -30,6 +30,18 @@ pub struct Settings {
     /// Command prefixes that are auto-approved (no confirm dialog).
     #[serde(default = "default_cmd_allow_list")]
     pub cmd_allow_list: Vec<String>,
+    /// If true, `start_goal` runs the plan → execute → review → retry loop
+    /// without waiting for user intervention between tasks.
+    #[serde(default)]
+    pub autonomous_mode: bool,
+    /// Maximum retries the controller will attempt on a single failed task
+    /// before marking it as failed and moving on.
+    #[serde(default = "default_max_retries_per_task")]
+    pub max_retries_per_task: u32,
+    /// Hard safety ceiling for the total number of tasks in a single goal's
+    /// task tree. The planner is asked for at most this many tasks.
+    #[serde(default = "default_max_total_tasks")]
+    pub max_total_tasks: u32,
 }
 
 fn default_true() -> bool {
@@ -37,6 +49,12 @@ fn default_true() -> bool {
 }
 fn default_max_iterations() -> u32 {
     8
+}
+fn default_max_retries_per_task() -> u32 {
+    3
+}
+fn default_max_total_tasks() -> u32 {
+    20
 }
 fn default_openrouter_model() -> String {
     std::env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into())
@@ -73,6 +91,9 @@ impl Default for Settings {
             max_iterations: default_max_iterations(),
             cmd_confirm_required: true,
             cmd_allow_list: default_cmd_allow_list(),
+            autonomous_mode: false,
+            max_retries_per_task: default_max_retries_per_task(),
+            max_total_tasks: default_max_total_tasks(),
         }
     }
 }
