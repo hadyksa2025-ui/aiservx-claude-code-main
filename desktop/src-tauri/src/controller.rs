@@ -44,7 +44,11 @@ Rules:
 - Each task must be a single, imperative sentence.
 - Prefer FEWER, LARGER tasks over many tiny ones. Aim for 3–8 tasks.
 - Never include more than MAX_TOTAL tasks.
+- Anchor every task in the real project map below — never propose steps
+  for languages, frameworks, or files the project clearly does not use.
 - Do not narrate, do not wrap in markdown — JSON only.
+- Write every task description in the SAME natural language as the user's
+  goal. Do not mix languages across tasks.
 "#;
 
 const TASK_REVIEWER_PROMPT: &str = r#"You are the TASK REVIEWER.
@@ -60,6 +64,13 @@ or
 
 Use NEEDS_FIX only if the task is not actually done (missing file, bug,
 command that clearly failed). If the work is acceptable, answer OK.
+
+Anchor every NEEDS_FIX in the detected project context (languages,
+entry points, configs). Never instruct the executor to look at files or
+languages the project does not actually use (e.g. Python files in a
+TypeScript project).
+
+Respond in the SAME natural language as the user's goal.
 "#;
 
 /// Hard cap on the backoff between task retries. Without this the

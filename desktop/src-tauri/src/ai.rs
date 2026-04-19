@@ -60,6 +60,9 @@ Output format: 3–7 bullets, each bullet an imperative sentence. Never
 invent files that do not exist — check with list_dir/read_file first.
 Do NOT write to disk and do NOT run shell commands; leave that to the
 executor.
+
+Language: respond in the SAME natural language as the user's most
+recent message. Do not switch languages mid-response.
 "#;
 
 const EXECUTOR_PROMPT: &str = r#"You are the EXECUTOR in a multi-agent coding assistant.
@@ -80,6 +83,14 @@ Rules:
   them. After the last tool call, produce a short human summary of what you
   did.
 - If you do not need any tools, just answer the user directly.
+- Never assume a language, framework, or file exists. If a PROJECT
+  CONTEXT message is present, trust those facts over any prior
+  assumption; otherwise verify with list_dir / read_file before acting.
+- Do not invent hypothetical files or "mentally review" imaginary
+  reports — only work with files you actually read via tools.
+
+Language: respond in the SAME natural language as the user's most
+recent message. Do not switch languages mid-response.
 "#;
 
 const REVIEWER_PROMPT: &str = r#"You are the REVIEWER in a multi-agent coding assistant.
@@ -96,6 +107,14 @@ or
 Use NEEDS_FIX only for concrete problems you can point at (wrong file, missing
 step, bug in generated code, command that clearly failed). If the executor's
 work is acceptable, answer OK.
+
+Critical: when a PROJECT CONTEXT message lists the detected languages,
+entry points, and configs, never ask the executor to look at files or
+languages that are not in that context (e.g. asking for Python files in
+a TypeScript project). Ground every NEEDS_FIX in the context you were given.
+
+Language: respond in the SAME natural language as the user's most
+recent message.
 "#;
 
 /// Which agent produced an event. Surfaced on every UI event for badging.
@@ -237,9 +256,19 @@ impl WireMessage {
     }
 }
 
-fn build_executor_messages(history: &[UiMessage], user: &str, plan: Option<&str>) -> Vec<WireMessage> {
-    let mut msgs = Vec::with_capacity(history.len() + 3);
+fn build_executor_messages(
+    history: &[UiMessage],
+    user: &str,
+    plan: Option<&str>,
+    project_ctx: Option<&str>,
+) -> Vec<WireMessage> {
+    let mut msgs = Vec::with_capacity(history.len() + 4);
     msgs.push(WireMessage::system(EXECUTOR_PROMPT));
+    if let Some(ctx) = project_ctx {
+        if !ctx.trim().is_empty() {
+            msgs.push(WireMessage::system(ctx));
+        }
+    }
     if let Some(plan_text) = plan {
         if !plan_text.trim().is_empty() {
             msgs.push(WireMessage::system(&format!(
@@ -739,6 +768,14 @@ pub(crate) async fn run_chat_turn(
     let max_iterations = (settings.max_iterations as usize).min(MAX_ITERATIONS_CEILING);
     let schema = tools::tool_schema();
 
+    // Load the persisted project map once per turn and pass it to every
+    // agent role as a second system message. Keeps the planner / executor /
+    // reviewer anchored to real detected facts (languages, entry points,
+    // deps) instead of hallucinating Python files on a React project.
+    let project_ctx: Option<String> =
+        crate::project_scan::project_context_summary(&project_dir);
+    let project_ctx_ref: Option<&str> = project_ctx.as_deref();
+
     let mut all_tool_calls: Vec<UiToolCall> = Vec::new();
     let mut all_tool_results: Vec<UiToolResult> = Vec::new();
     let mut touched_files: Vec<String> = Vec::new();
@@ -749,7 +786,7 @@ pub(crate) async fn run_chat_turn(
     // ---- Phase 1: Planner ----
     let plan_text: Option<String> = if use_planner {
         emit_step(&app, &mut steps, Role::Planner, "planning", "running");
-        match stream_openrouter(&app, &settings, None, &planner_messages(&history, &message), None, Role::Planner, &cancel).await {
+        match stream_openrouter(&app, &settings, None, &planner_messages(&history, &message, project_ctx_ref), None, Role::Planner, &cancel).await {
             Ok(msg) => {
                 let text = msg.content.clone().unwrap_or_default();
                 finish_step(&app, &mut steps, "done", Some(&first_line(&text)));
@@ -776,7 +813,7 @@ pub(crate) async fn run_chat_turn(
     };
 
     // ---- Phase 2: Executor tool loop ----
-    let mut messages = build_executor_messages(&history, &message, plan_text.as_deref());
+    let mut messages = build_executor_messages(&history, &message, plan_text.as_deref(), project_ctx_ref);
     let mut final_assistant = String::new();
     let mut executor_iterations = 0usize;
     let mut reviewer_retries_left = if settings.reviewer_enabled {
@@ -942,7 +979,7 @@ pub(crate) async fn run_chat_turn(
             break 'outer;
         }
         emit_step(&app, &mut steps, Role::Reviewer, "reviewing", "running");
-        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls);
+        let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls, project_ctx_ref);
         // Reviewer prefers the planner (OpenRouter) if available, else executor.
         let review_result = if use_planner {
             stream_openrouter(&app, &settings, None, &review_messages, None, Role::Reviewer, &cancel).await
@@ -1030,9 +1067,18 @@ pub(crate) async fn run_chat_turn(
 
 // ---------- Helpers ----------
 
-fn planner_messages(history: &[UiMessage], user: &str) -> Vec<WireMessage> {
-    let mut msgs = Vec::with_capacity(history.len() + 2);
+fn planner_messages(
+    history: &[UiMessage],
+    user: &str,
+    project_ctx: Option<&str>,
+) -> Vec<WireMessage> {
+    let mut msgs = Vec::with_capacity(history.len() + 3);
     msgs.push(WireMessage::system(PLANNER_PROMPT));
+    if let Some(ctx) = project_ctx {
+        if !ctx.trim().is_empty() {
+            msgs.push(WireMessage::system(ctx));
+        }
+    }
     for m in history {
         match m.role.as_str() {
             "user" => msgs.push(WireMessage::user(&m.content)),
@@ -1044,7 +1090,12 @@ fn planner_messages(history: &[UiMessage], user: &str) -> Vec<WireMessage> {
     msgs
 }
 
-fn reviewer_messages(user: &str, assistant: &str, calls: &[UiToolCall]) -> Vec<WireMessage> {
+fn reviewer_messages(
+    user: &str,
+    assistant: &str,
+    calls: &[UiToolCall],
+    project_ctx: Option<&str>,
+) -> Vec<WireMessage> {
     let tool_summary = if calls.is_empty() {
         "(no tools were called)".to_string()
     } else {
@@ -1057,10 +1108,15 @@ fn reviewer_messages(user: &str, assistant: &str, calls: &[UiToolCall]) -> Vec<W
     let transcript = format!(
         "User request:\n{user}\n\nExecutor tool calls:\n{tool_summary}\n\nExecutor summary:\n{assistant}\n"
     );
-    vec![
-        WireMessage::system(REVIEWER_PROMPT),
-        WireMessage::user(&transcript),
-    ]
+    let mut msgs: Vec<WireMessage> = Vec::with_capacity(3);
+    msgs.push(WireMessage::system(REVIEWER_PROMPT));
+    if let Some(ctx) = project_ctx {
+        if !ctx.trim().is_empty() {
+            msgs.push(WireMessage::system(ctx));
+        }
+    }
+    msgs.push(WireMessage::user(&transcript));
+    msgs
 }
 
 fn args_preview(v: &Value) -> String {

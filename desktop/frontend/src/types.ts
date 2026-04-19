@@ -161,6 +161,13 @@ export type TaskAddedEvent = {
 export type TaskUpdateEvent = {
   goal_id: string;
   id: string;
+  /**
+   * Backend ships the task description on every update so the UI can
+   * render a real label when a `task:update` arrives before the matching
+   * `task:added` (late subscription, reloaded tree, etc.). Marked
+   * optional for backwards-compat with older payloads.
+   */
+  description?: string;
   status: TaskStatus;
   retries?: number;
   result?: string | null;

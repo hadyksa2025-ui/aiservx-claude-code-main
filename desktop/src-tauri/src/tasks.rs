@@ -9,7 +9,7 @@
 //!
 //! - `task:goal_started`   { goal, task_count }
 //! - `task:added`          { task }
-//! - `task:update`         { id, status, retries, result, updated_at }
+//! - `task:update`         { id, description, status, retries, result, updated_at }
 //! - `task:goal_done`      { goal, status, completed, failed }
 //! - `task:failure_logged` { task_id, error }
 
@@ -147,6 +147,11 @@ pub fn emit_task_update(app: &AppHandle, goal_id: &str, task: &Task) {
         json!({
             "goal_id": goal_id,
             "id": task.id,
+            // Ship the description on every update so the UI can render a
+            // meaningful label even when a `task:update` arrives before
+            // the matching `task:added` (e.g. after a late subscription
+            // or reload of the active tree).
+            "description": task.description,
             "status": task.status,
             "retries": task.retries,
             "result": task.result,

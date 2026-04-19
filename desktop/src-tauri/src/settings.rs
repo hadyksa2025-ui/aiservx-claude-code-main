@@ -85,10 +85,17 @@ fn default_max_total_tasks() -> u32 {
     20
 }
 fn default_task_timeout_secs() -> u64 {
-    180
+    // Local CPU-only models doing multi-step code analysis routinely need
+    // 3–6 minutes per task; the previous 180s default caused the first-run
+    // experience to timeout on real projects. The cancel + circuit-breaker
+    // layer still bounds worst-case runtime.
+    600
 }
 fn default_goal_timeout_secs() -> u64 {
-    3600
+    // Raised in lockstep with `task_timeout_secs` so a 20-task goal has
+    // realistic headroom. Users who want tighter bounds can lower either
+    // knob from Settings.
+    7200
 }
 fn default_retry_backoff_base_ms() -> u64 {
     1000

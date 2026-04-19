@@ -109,13 +109,15 @@ export function TaskPanel({ projectDir, disabled }: Props) {
           if (!prev || prev.id !== p.goal_id) return prev;
           // Upsert: if the update arrives before the matching `task:added`
           // (rare but possible under burst conditions), synthesize a
-          // minimal row so the UI doesn't drop the signal.
+          // minimal row so the UI doesn't drop the signal. Backend ships
+          // the real description on every `task:update` so the row gets
+          // a meaningful label instead of a placeholder.
           const existing = prev.tasks.find((t) => t.id === p.id);
           if (!existing) {
             const now = Math.floor(Date.now() / 1000);
             const synthesized: Task = {
               id: p.id,
-              description: "(task from update event)",
+              description: p.description ?? "(task)",
               status: (p.status ?? "pending") as TaskStatus,
               retries: p.retries ?? 0,
               deps: [],
@@ -131,6 +133,10 @@ export function TaskPanel({ projectDir, disabled }: Props) {
               t.id === p.id
                 ? {
                     ...t,
+                    // Let the backend correct a placeholder description
+                    // the moment a real one becomes available, but never
+                    // overwrite a genuine description with a placeholder.
+                    description: p.description ?? t.description,
                     status: p.status ?? t.status,
                     // Prefer the explicit retries count from the backend;
                     // only fall back to the `retries_bumped` signal when

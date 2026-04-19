@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const MAX_WALK_DEPTH: usize = 4;
@@ -43,7 +43,7 @@ const IGNORE_DIRS: &[&str] = &[
     ".nx",
 ];
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMap {
     pub root: String,
     pub scanned_at: u64,
@@ -321,6 +321,75 @@ fn walk(
             walk(root, &abs, depth + 1, cb);
         }
     }
+}
+
+/// Read back a previously persisted `ProjectMap` from
+/// `PROJECT_MEMORY.json → project_map`. Returns `None` if the memory file
+/// is missing, malformed, or has no `project_map` entry — callers treat
+/// absence as "no context available".
+pub fn load_project_map(project_dir: &str) -> Option<ProjectMap> {
+    let path = std::path::PathBuf::from(project_dir).join("PROJECT_MEMORY.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mem: Value = serde_json::from_str(&text).ok()?;
+    let entry = mem.get("project_map")?.clone();
+    if entry.is_null() {
+        return None;
+    }
+    serde_json::from_value(entry).ok()
+}
+
+/// Build a short, model-facing summary of the project map so every agent
+/// (planner / executor / reviewer) can anchor its reasoning in reality
+/// instead of guessing at languages and entry points. Returns `None` when
+/// no `ProjectMap` is available yet.
+pub fn project_context_summary(project_dir: &str) -> Option<String> {
+    let map = load_project_map(project_dir)?;
+    let langs = if map.languages.is_empty() {
+        "unknown".to_string()
+    } else {
+        map.languages.join(", ")
+    };
+    let entries = if map.entry_points.is_empty() {
+        "(none detected)".to_string()
+    } else {
+        map.entry_points
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let configs = if map.configs.is_empty() {
+        "(none detected)".to_string()
+    } else {
+        map.configs
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let deps = if map.dependencies.is_empty() {
+        "(none detected)".to_string()
+    } else {
+        map.dependencies
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(format!(
+        "PROJECT CONTEXT (anchor every step to these facts — do NOT invent files or languages):\n\
+         - root: {}\n\
+         - detected languages: {}\n\
+         - entry points: {}\n\
+         - key configs: {}\n\
+         - dependencies (sample): {}\n\
+         - workspace/monorepo: {}\n\
+         Before claiming a file or language exists, confirm with list_dir / read_file.",
+        map.root, langs, entries, configs, deps, map.workspace
+    ))
 }
 
 /// Persist a freshly built `ProjectMap` into `PROJECT_MEMORY.json →
