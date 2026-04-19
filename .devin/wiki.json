@@ -1,0 +1,263 @@
+{
+  "repo_notes": [
+    {
+      "content": ""
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "High-level introduction to Open Claude Code: what it is, its two major components (the Tauri desktop app and the CLI research snapshot), the three-agent architecture, and how to navigate the wiki.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Getting Started",
+      "purpose": "Step-by-step setup for both the desktop app and the CLI snapshot: prerequisites (Bun, Rust, Ollama), build commands, environment variables, and first-run checklist.",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Repository Layout",
+      "purpose": "Map of the monorepo: what lives in desktop/, src/, stubs/, docs/, and scripts/; which parts are the active desktop app vs. the read-only CLI research snapshot; and how the two sub-projects relate.",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Desktop Application Architecture",
+      "purpose": "Overview of the Tauri desktop app: how the Rust backend and React frontend are structured, how they communicate, and links to child pages covering each layer in depth.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Rust Backend (src-tauri)",
+      "purpose": "Deep dive into the Tauri Rust backend: AppState, module layout (ai.rs, controller.rs, fs_ops.rs, tools.rs, memory.rs, tasks.rs, trace.rs, cancel.rs, watcher.rs, project_scan.rs, settings.rs), and the Tauri command registry exposed to the frontend.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "AI Orchestration Layer (ai.rs)",
+      "purpose": "Detailed coverage of the three-agent loop in ai.rs: Planner (OpenRouter), Executor (Ollama tool-calling loop), and Reviewer; streaming via SSE; the send_chat Tauri command; fallback/degradation behavior; and the system prompts for each role.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Autonomous Controller (controller.rs & tasks.rs)",
+      "purpose": "How start_goal works: project scanning, goal planning, sequential task execution, retry/backoff logic, circuit breaker, RunningGuard RAII pattern, TaskTree lifecycle, task status transitions, and task_history archival.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Tool Runtime & Filesystem Sandbox (tools.rs & fs_ops.rs)",
+      "purpose": "The four AI-accessible tools (read_file, write_file, list_dir, run_cmd); the deny-list and allow-list safety model for run_cmd; the fs_ops::resolve sandbox that prevents directory traversal; the confirm gate for irreversible operations; and process tree-kill on cancellation.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Cancellation, Memory & Persistence",
+      "purpose": "CancelToken design (lock-free AtomicBool + Notify, child linking, CancelReason enum); PROJECT_MEMORY.json schema (version 2, atomic write pattern, 4 MiB cap); memory.rs load/save/migrate; trace.rs bounded execution transcripts (MAX_ENTRIES=200, MAX_TEXT_CHARS=4096); and the watcher.rs debounced fs:changed events.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "React Frontend (desktop/frontend)",
+      "purpose": "Overview of the four-pane React/TypeScript UI: how it is built with Vite + Tailwind, how it communicates with the Rust backend via Tauri invoke/events, and links to child pages for each major component.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "UI Components",
+      "purpose": "Detailed coverage of each frontend component: Explorer (file tree + fs:changed watcher), Chat (streaming bubbles per agent role), TaskPanel (goal input, task tree, trace disclosure), Execution (live event timeline with diffs), Settings modal (all configurable knobs), and ConfirmCmd overlay (approve/deny gate).",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Frontend API Bridge &  Type System",
+      "purpose": "How api.ts wraps Tauri invoke calls with typed commands; the onEvent helper for typed event subscriptions; the full TypeScript type system in types.ts (FsEntry, ChatMessage, ToolCall, ToolResult, Task, TaskTree, TraceEntry, Settings, AgentRole, etc.); and how types mirror the Rust backend structs.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Settings & Configuration",
+      "purpose": "All configurable settings in the Settings struct (Rust) and Settings type (TypeScript): AI provider keys and models, reviewer toggle, iteration caps, timeout values, autonomous mode, confirm-irreversible toggle, cmd_allow_list, circuit breaker threshold, retry backoff, and how settings are persisted to the app config directory.",
+      "parent": "Desktop Application Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "CLI Research Snapshot (src/)",
+      "purpose": "Overview of the read-only src/ directory: what it is (a snapshot of the upstream Claude Code CLI), why it exists in this repo, and how it differs from the active desktop app. Links to child pages for the CLI's own architecture.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "CLI Entrypoints & Initialization",
+      "purpose": "The bootstrap pipeline: cli.tsx (fast-path dispatcher), main.tsx (eager startup: MDM reads, keychain prefetch, Ink UI init, permission-mode setup), init.ts (CA certs, proxy, mTLS, telemetry, API preconnection), and the specialized modes (bridge, daemon, server, environment-runner, self-hosted-runner).",
+      "parent": "CLI Research Snapshot (src/)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "QueryEngine & Conversation Loop",
+      "purpose": "How QueryEngine.ts orchestrates the turn-by-turn conversation: context assembly (context.ts, context/), model queries (query.ts), tool-call loop, permission-denial tracking, usage accounting, session persistence (sessionStorage.ts, history.ts), and memory prompts (memdir/).",
+      "parent": "CLI Research Snapshot (src/)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Tools, Commands & Skills",
+      "purpose": "The CLI tool registry (tools.ts) with feature-gating and permission-mode checks; the slash-command registry (commands.ts) merging static and dynamic commands; the skills system (src/skills/bundled/); the plugin scaffolding (src/plugins/bundled/); and the full list of available tools (BashTool, FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool, AgentTool, WebFetchTool, etc.).",
+      "parent": "CLI Research Snapshot (src/)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Services & Integrations",
+      "purpose": "The services layer (src/services/): MCP (Model Context Protocol) client and server integration, OAuth, analytics/telemetry (OpenTelemetry), remote managed settings and policy limits, LSP integration, compact/context-collapse, session transcript, and the API layer (src/services/api/).",
+      "parent": "CLI Research Snapshot (src/)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Build, Tooling & Infrastructure",
+      "purpose": "Overview of the build pipeline for both sub-projects, CI/CD tooling, and the stubs layer. Links to child pages for each build system.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Desktop Build Pipeline",
+      "purpose": "How the desktop app is built: Vite + React frontend (vite.config.ts, tsconfig.json, Tailwind CSS, bun.lock), Tauri Rust backend (Cargo.toml, tauri.conf.json, capabilities/), the two-stage build (frontend assets → embedded in Tauri binary), and how to run in dev mode vs. produce a release binary.",
+      "parent": "Build, Tooling & Infrastructure",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "CLI Build & Scripts",
+      "purpose": "How the CLI snapshot is built with Bun (scripts/build.ts, scripts/build-exe.ts); the Windows snapshot runner (scripts/run-snapshot.ps1) and .codex-home isolation; the stubs layer (stubs/@ant/, stubs/@anthropic-ai/, native N-API stubs) and why they exist; and the bun.lock dependency manifest.",
+      "parent": "Build, Tooling & Infrastructure",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "User Guide & Operational Patterns",
+      "purpose": "Practical guidance for using the system: when to use autonomous mode vs. chat, how to write effective goals, how to read execution traces, how to stop things safely, and when to intervene manually. Covers the docs/ directory content.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Running Goals & Autonomous Mode",
+      "purpose": "Step-by-step guide to running a goal: opening a project, configuring settings, writing good goal descriptions (rules of thumb, good vs. bad examples), watching the task tree fill in, and understanding the autonomous vs. manual-approval modes.",
+      "parent": "User Guide & Operational Patterns",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Reading Traces & Debugging",
+      "purpose": "How to read a per-task execution trace (entry kinds: User, System, Planner, Executor, ToolCall, ToolResult, Reviewer, Retry, Error); common trace patterns and what they mean; using the Execution pane vs. the persisted trace in PROJECT_MEMORY.json; and the EVALUATION.md honest assessment of system strengths and limitations.",
+      "parent": "User Guide & Operational Patterns",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Cancellation & Safety",
+      "purpose": "How to stop things safely: cancel chat vs. cancel goal; what happens mid-SSE and mid-subprocess (SIGTERM → SIGKILL tree-kill); timeout behaviors (task_timeout_secs, goal_timeout_secs); circuit breaker; the autonomous_confirm_irreversible toggle and when to enable it; and best practices for committing between goals.",
+      "parent": "User Guide & Operational Patterns",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Glossary",
+      "purpose": "Definitions of all codebase-specific terms, abbreviations, and domain concepts that an onboarding engineer needs to know, with code pointers to the relevant files and functions.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    }
+  ]
+}
