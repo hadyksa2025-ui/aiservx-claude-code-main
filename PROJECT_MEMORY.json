@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "updated_at": null,
+  "project": {
+    "root": "open-claude-code-main",
+    "editable_scope": ["desktop/"],
+    "read_only_scope": ["src/", "stubs/", "scripts/", "types/"],
+    "goal": "Turn the desktop/ wrapper into a small AI IDE powered by a hybrid OpenRouter+Ollama loop."
+  },
+  "architecture": {
+    "frontend": {
+      "path": "desktop/frontend",
+      "stack": ["vite", "react", "typescript"],
+      "entry": "desktop/frontend/src/main.tsx",
+      "build_output": "desktop/dist"
+    },
+    "backend": {
+      "path": "desktop/src-tauri",
+      "stack": ["tauri@2", "tokio", "reqwest", "notify", "serde"],
+      "entry": "desktop/src-tauri/src/lib.rs"
+    },
+    "ai_layer": {
+      "planner": {
+        "provider": "openrouter",
+        "default_model": "openrouter/auto",
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions"
+      },
+      "executor": {
+        "provider": "ollama",
+        "default_model": "llama3.1:8b",
+        "endpoint_suffix": "/api/chat"
+      },
+      "fallback_policy": "If planner fails or OPENROUTER_API_KEY missing, executor handles end-to-end."
+    }
+  },
+  "tauri_commands": [
+    { "name": "list_dir",       "description": "Recursive shallow listing of a directory." },
+    { "name": "read_file",      "description": "Read a UTF-8 file under the opened project root." },
+    { "name": "write_file",     "description": "Write a UTF-8 file under the opened project root. Returns diff." },
+    { "name": "watch_dir",      "description": "Start a recursive notify watcher; emits fs:changed events." },
+    { "name": "unwatch_dir",    "description": "Stop a previously started watcher." },
+    { "name": "run_cmd",        "description": "Run a short shell command inside the opened project root." },
+    { "name": "send_chat",      "description": "Send a user message through the hybrid AI loop." },
+    { "name": "get_settings",   "description": "Read persisted settings (api keys, models, base urls)." },
+    { "name": "save_settings",  "description": "Write persisted settings to the app config directory." },
+    { "name": "load_memory",    "description": "Load PROJECT_MEMORY.json from the opened project root." },
+    { "name": "save_memory",    "description": "Save PROJECT_MEMORY.json into the opened project root." }
+  ],
+  "tool_schema": [
+    {
+      "name": "read_file",
+      "description": "Read a text file relative to the opened project root.",
+      "parameters": {
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "write_file",
+      "description": "Write a text file relative to the opened project root. Overwrites.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      }
+    },
+    {
+      "name": "list_dir",
+      "description": "List files in a directory relative to the opened project root.",
+      "parameters": {
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "run_cmd",
+      "description": "Run a short shell command inside the opened project root. Returns stdout+stderr.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": { "type": "string" },
+          "timeout_ms": { "type": "integer" }
+        },
+        "required": ["cmd"]
+      }
+    }
+  ],
+  "events": [
+    { "name": "ai:token",       "payload": { "text": "string" } },
+    { "name": "ai:tool_call",   "payload": { "id": "string", "name": "string", "args": "object" } },
+    { "name": "ai:tool_result", "payload": { "id": "string", "ok": "boolean", "output": "string", "diff": "string|null" } },
+    { "name": "ai:done",        "payload": { "assistant": "string" } },
+    { "name": "ai:error",       "payload": { "message": "string" } },
+    { "name": "fs:changed",     "payload": { "path": "string", "kind": "created|modified|removed|renamed" } }
+  ],
+  "session": {
+    "turns": [],
+    "opened_project": null
+  },
+  "delivery_status": {
+    "pr_1": {
+      "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1",
+      "title": "desktop: AI IDE foundation — React SPA + Tauri v2 backend + hybrid AI loop",
+      "state": "open",
+      "ci": "green (no GitHub Actions; Devin Review passed)",
+      "includes": [
+        "React SPA (Vite + React 18 + TS)",
+        "Tauri v2 commands: list_dir, read_file, write_file, watch_dir, run_cmd, send_chat, settings, memory",
+        "Hybrid AI loop (OpenRouter planner + Ollama executor) with graceful fallback",
+        "Persistent PROJECT_MEMORY.json writes from Rust",
+        "PROJECT_PLAN.md + PROJECT_MEMORY.json docs"
+      ]
+    },
+    "blockers": [
+      "Extraction of logic from src/ is paused pending written Anthropic authorization."
+    ],
+    "next_clean_room_phases": [
+      "Streaming tokens (SSE) from OpenRouter + Ollama to ai:token events",
+      "Reviewer agent: plan -> execute -> review -> fix",
+      "Autonomous retry loop with bounded iterations",
+      "Richer memory: file index, decision log",
+      "Inline diff viewer in Execution pane",
+      "run_cmd safety: allow-list + user-confirm dialog"
+    ]
+  },
+  "file_index": [],
+  "tool_usage": {
+    "read_file": 0,
+    "write_file": 0,
+    "list_dir": 0,
+    "run_cmd": 0
+  },
+  "notes": [
+    "Rust rewrites this file on every chat turn via memory::save.",
+    "Do not hand-edit during a session; edits will be overwritten."
+  ]
+}
