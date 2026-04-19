@@ -23,6 +23,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
+use crate::cancel::CancelToken;
 use crate::{fs_ops, AppState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,12 +166,20 @@ pub async fn execute_safe(
 /// Gated `run_cmd`. Applies the deny-list and allow-list, emits an
 /// `ai:confirm_request` event for everything else, and awaits the UI's
 /// decision (up to 10 minutes) before executing.
+///
+/// `cancel` is checked before the deny-list, races the confirm modal
+/// await, and is threaded into the child-process wait so cancel aborts
+/// this call no matter where it is parked.
 pub async fn execute_run_cmd_gated(
     app: &AppHandle,
     state: &AppState,
     project_dir: &str,
     args: &Value,
+    cancel: &CancelToken,
 ) -> Result<(String, Option<String>, ToolEffect), String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
     let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("").trim();
     let timeout_ms = args
         .get("timeout_ms")
@@ -213,19 +222,29 @@ pub async fn execute_run_cmd_gated(
                 "timeout_ms": timeout_ms,
             }),
         );
-        let approved = match tokio::time::timeout(Duration::from_secs(600), rx).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => false, // sender dropped -> deny
-            Err(_) => {
-                // Timed out. Evict the pending confirm so it doesn't leak.
+        let approved = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Evict and return cancelled. The modal will disappear
+                // when the event listener on the UI side tears down.
                 let mut map = state.pending_confirms.lock().unwrap();
                 map.remove(&id);
-                return Ok((
-                    "refused: confirmation timed out (10 minutes).".into(),
-                    None,
-                    ToolEffect::default(),
-                ));
+                return Err("cancelled".into());
             }
+            r = tokio::time::timeout(Duration::from_secs(600), rx) => match r {
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => false, // sender dropped -> deny
+                Err(_) => {
+                    // Timed out. Evict the pending confirm so it doesn't leak.
+                    let mut map = state.pending_confirms.lock().unwrap();
+                    map.remove(&id);
+                    return Ok((
+                        "refused: confirmation timed out (10 minutes).".into(),
+                        None,
+                        ToolEffect::default(),
+                    ));
+                }
+            },
         };
         if !approved {
             return Ok((
@@ -236,7 +255,7 @@ pub async fn execute_run_cmd_gated(
         }
     }
 
-    let result = run_cmd_impl(project_dir, cmd, timeout_ms).await?;
+    let result = run_cmd_impl(project_dir, cmd, timeout_ms, Some(cancel)).await?;
     let mut out = String::new();
     out.push_str(&format!("exit {}\n", result.exit_code));
     if !result.stdout.is_empty() {
@@ -308,7 +327,9 @@ pub async fn run_cmd(
     cmd: String,
     timeout_ms: Option<u64>,
 ) -> Result<RunCmdResult, String> {
-    run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000)).await
+    // Direct user-initiated invocation: no cooperative cancel is wired
+    // here, only the timeout.
+    run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000), None).await
 }
 
 /// Resolves a pending `ai:confirm_request`. Used by the UI's confirm modal.
@@ -335,6 +356,7 @@ async fn run_cmd_impl(
     project_dir: &str,
     cmd: &str,
     timeout_ms: u64,
+    cancel: Option<&CancelToken>,
 ) -> Result<RunCmdResult, String> {
     let root = std::path::Path::new(project_dir)
         .canonicalize()
@@ -354,31 +376,76 @@ async fn run_cmd_impl(
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
 
-    let wait_fut = async {
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        let mut out_str = String::new();
-        if let Some(mut so) = stdout {
-            let _ = so.read_to_string(&mut out_str).await;
+    // Drive the child through its cancel/timeout gauntlet. On cancel we
+    // send a SIGKILL-equivalent via `child.kill()` so we don't leak a
+    // runaway process; the reaped status is discarded.
+    let cancel_fut = async {
+        match cancel {
+            Some(c) => c.cancelled().await,
+            None => std::future::pending::<()>().await,
         }
-        let mut err_str = String::new();
-        if let Some(mut se) = stderr {
-            let _ = se.read_to_string(&mut err_str).await;
-        }
-        Ok::<_, String>((status, out_str, err_str))
     };
 
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), wait_fut).await {
-        Ok(Ok((status, stdout, stderr))) => Ok(RunCmdResult {
-            stdout,
-            stderr,
-            exit_code: status.code().unwrap_or(-1),
-        }),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(format!("run_cmd timed out after {timeout_ms}ms")),
+    let timeout_dur = Duration::from_millis(timeout_ms);
+
+    let status = tokio::select! {
+        biased;
+        _ = cancel_fut => {
+            // Best-effort kill. The child may already be dead; ignore
+            // the error in that case.
+            let _ = child.kill().await;
+            return Err("cancelled".into());
+        }
+        r = tokio::time::timeout(timeout_dur, child.wait()) => match r {
+            Ok(s) => s.map_err(|e| e.to_string())?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(format!("run_cmd timed out after {timeout_ms}ms"));
+            }
+        }
+    };
+
+    // Drain pipes after the child has exited (or been killed). The drain
+    // itself is also cancel-aware so a late cancel doesn't hang here.
+    let mut out_str = String::new();
+    if let Some(ref mut so) = stdout_pipe {
+        let drain = so.read_to_string(&mut out_str);
+        let cancel_fut = async {
+            match cancel {
+                Some(c) => c.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel_fut => return Err("cancelled".into()),
+            _ = drain => {}
+        }
     }
+    let mut err_str = String::new();
+    if let Some(ref mut se) = stderr_pipe {
+        let drain = se.read_to_string(&mut err_str);
+        let cancel_fut = async {
+            match cancel {
+                Some(c) => c.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel_fut => return Err("cancelled".into()),
+            _ = drain => {}
+        }
+    }
+
+    Ok(RunCmdResult {
+        stdout: out_str,
+        stderr: err_str,
+        exit_code: status.code().unwrap_or(-1),
+    })
 }
 
 // Silence the unused-import lint when this module's `HashMap` re-export is
@@ -386,4 +453,78 @@ async fn run_cmd_impl(
 #[allow(dead_code)]
 fn _keep_hashmap_in_scope() -> HashMap<String, String> {
     HashMap::new()
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::time::Instant;
+
+    // Spawn a long-running child inside a tempdir, trip the cancel
+    // token mid-flight, and assert we come back with `Err("cancelled")`
+    // well before the command's natural runtime would have elapsed. This
+    // is the test that proves we are killing the subprocess, not just
+    // checking a flag between iterations.
+    #[tokio::test]
+    async fn run_cmd_cancel_mid_flight_kills_child() {
+        let dir = std::env::temp_dir();
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            t2.cancel();
+        });
+        let start = Instant::now();
+        // 30s sleep; if cancellation worked we return inside ~200ms.
+        let res = run_cmd_impl(
+            dir.to_str().unwrap(),
+            if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
+            30_000,
+            Some(&token),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&res, Err(e) if e == "cancelled"),
+            "expected cancelled, got {:?}",
+            res
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel should unwind within a few seconds, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cmd_pre_cancelled_token_returns_before_spawn_completes() {
+        let dir = std::env::temp_dir();
+        let token = CancelToken::new();
+        token.cancel();
+        let res = run_cmd_impl(
+            dir.to_str().unwrap(),
+            if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
+            30_000,
+            Some(&token),
+        )
+        .await;
+        assert!(matches!(&res, Err(e) if e == "cancelled"));
+    }
+
+    // A healthy command with no cancel should complete normally through
+    // the new select! path and not be affected by the cancel plumbing.
+    #[tokio::test]
+    async fn run_cmd_no_cancel_runs_to_completion() {
+        let dir = std::env::temp_dir();
+        let res = run_cmd_impl(
+            dir.to_str().unwrap(),
+            if cfg!(windows) { "echo hi" } else { "echo hi" },
+            10_000,
+            None,
+        )
+        .await
+        .expect("command should succeed");
+        assert_eq!(res.exit_code, 0);
+        assert!(res.stdout.contains("hi"));
+    }
 }

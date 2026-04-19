@@ -20,6 +20,7 @@ use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod ai;
+mod cancel;
 mod controller;
 mod fs_ops;
 mod memory;
@@ -37,12 +38,18 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     /// Running directory watchers, keyed by project root.
     pub watchers: watcher::Watchers,
-    /// Cancellation flag shared by in-flight chat loops.
-    pub cancelled: Mutex<bool>,
-    /// Cancellation flag for the top-level autonomous goal loop. Separate
+    /// Cancellation token shared by in-flight chat loops. Cooperative
+    /// cancellation is implemented via `CancelToken`: code can both
+    /// synchronously check `is_cancelled()` and asynchronously race a
+    /// `select!` against `cancelled()` to abort in-flight tool execution
+    /// and SSE streams, not just wait until the next iteration boundary.
+    pub cancelled: cancel::CancelToken,
+    /// Cancellation token for the top-level autonomous goal loop. Separate
     /// from `cancelled` so that per-turn cancellation does not stop the
-    /// whole goal, and vice-versa.
-    pub goal_cancelled: Mutex<bool>,
+    /// whole goal, and vice-versa. The controller typically creates a
+    /// per-task child token that is linked from this one, so a goal cancel
+    /// aborts whatever task is currently executing.
+    pub goal_cancelled: cancel::CancelToken,
     /// `true` when a `start_goal` is currently in flight. Used by the
     /// controller as an idempotency guard against concurrent goal starts.
     pub goal_running: Mutex<bool>,
@@ -71,8 +78,8 @@ pub fn run() {
         .manage(AppState {
             settings: Mutex::new(initial_settings),
             watchers: watcher::Watchers::default(),
-            cancelled: Mutex::new(false),
-            goal_cancelled: Mutex::new(false),
+            cancelled: cancel::CancelToken::new(),
+            goal_cancelled: cancel::CancelToken::new(),
             goal_running: Mutex::new(false),
             pending_confirms: Mutex::new(HashMap::new()),
         })

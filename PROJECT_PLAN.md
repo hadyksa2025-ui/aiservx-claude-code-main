@@ -279,6 +279,76 @@ Added `cargo test` unit tests in `controller.rs`:
 See the PR #4 description / audit comment for the final YES/NO
 production-safety verdict and scenario-by-scenario trace.
 
+## 3.8 CancellationToken Plumbing (PR #5)
+
+Priority #1 blocker from the PR #4 audit: cancel was only observed between
+iterations. A user pressing *Cancel* during a streaming SSE read or a
+30-second `sleep` subprocess had to wait for that operation to finish on
+its own terms before the cancel took effect. That is unacceptable for
+any autonomous mode with a real cost/wall-clock budget.
+
+### New primitive: `cancel::CancelToken`
+
+- Lock-free hot path: `is_cancelled()` is an `AcqRel` atomic load,
+  `cancel()` is a single atomic swap plus a `Notify::notify_waiters()`.
+- Async `cancelled()` future usable in `tokio::select!`.
+- Cheap `Clone` (`Arc<Inner>`).
+- `reset()` re-arms per-turn usage without losing shared ownership.
+- `link_from(&parent)` spawns a propagator so any tree of tokens can
+  collapse into one awaitable future.
+
+### 8 call sites refactored
+
+| Layer       | Old (`Mutex<bool>`)                                  | New                                            |
+|-------------|------------------------------------------------------|------------------------------------------------|
+| AppState    | `cancelled: Mutex<bool>` / `goal_cancelled: Mutex<bool>` | `CancelToken` (cheap clone, lock-free check) |
+| `cancel_chat` | `*state.cancelled.lock().unwrap() = true`          | `state.cancelled.cancel()`                     |
+| `run_chat_turn` (reset) | `*state.cancelled.lock().unwrap() = false`| `state.cancelled.reset()`                      |
+| `run_chat_turn` (check) | `if *state.cancelled.lock().unwrap()`     | `if cancel.is_cancelled()`                     |
+| `cancel_goal` | `goal_cancelled.lock() = true; cancelled.lock()=true` | `state.goal_cancelled.cancel(); state.cancelled.cancel()` |
+| Controller iter check | `*state.goal_cancelled.lock().unwrap()`   | `state.goal_cancelled.is_cancelled()`          |
+| SSE stream (`stream_openrouter`, `stream_ollama`) | bare `while let Some(chunk) = stream.next().await` | `tokio::select! { _ = cancel.cancelled() => …; c = stream.next() => … }` → drops reader, returns `Err("cancelled")` |
+| `run_cmd_impl` child wait | `timeout(child.wait())` only | `select!` between `cancel.cancelled()` and `timeout(child.wait())`; on cancel **`child.kill()`** then return |
+
+Also made **`execute_run_cmd_gated`** race the confirm-modal `oneshot`
+against `cancel.cancelled()` — pressing cancel while the modal is up
+evicts the pending confirm and returns `cancelled`, not `denied`.
+
+### Tests
+
+Unit tests live next to the primitive and the runtime it plumbs into:
+
+- `cancel::tests::cancel_before_await_resolves_immediately`
+- `cancel::tests::cancel_during_await_wakes_waiter`
+- `cancel::tests::link_from_propagates_cancel`
+- `cancel::tests::link_from_already_cancelled_parent_cancels_child_immediately`
+- `cancel::tests::reset_clears_flag`
+- `cancel::tests::uncancelled_token_does_not_spuriously_fire`
+- `tools::cancel_tests::run_cmd_cancel_mid_flight_kills_child` —
+  spawns `sleep 30`, trips the token after 100 ms, asserts return in
+  < 5 s with `Err("cancelled")`. Proves we kill the subprocess.
+- `tools::cancel_tests::run_cmd_pre_cancelled_token_returns_before_spawn_completes`
+- `tools::cancel_tests::run_cmd_no_cancel_runs_to_completion` —
+  regression guard that the cancel plumbing doesn't break the normal
+  path.
+
+`cargo test --lib`: **14/14 pass.**
+
+### What this unblocks
+
+- Mid-SSE cancel works: cancel during a 30-second model stream tears
+  the TCP connection down immediately instead of billing out the rest.
+- Mid-`run_cmd` cancel works: cancel during a long `npm install` or
+  `cargo build` kills the child instead of waiting for the 3-minute
+  task timeout.
+- `cancel_goal` is now truthful: pressing it mid-task actually stops
+  the current task's work, not just prevents the *next* task from
+  starting.
+
+This is the "controlled" part of "controlled autonomous system".
+Follow-ups #6 (cost accounting), #7 (write-confirm opt-in), #8 (trace
+log) still pending.
+
 ## 4. Design Decisions
 
 - **Frontend framework**: Vite + React + TypeScript. Rationale: smallest

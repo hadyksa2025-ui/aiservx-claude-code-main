@@ -1,22 +1,39 @@
 {
   "schema_version": 2,
-  "updated_at": null,
+  "updated_at": "2026-04-19T03:55:00Z",
   "project": {
     "root": "open-claude-code-main",
-    "editable_scope": ["desktop/"],
-    "read_only_scope": ["src/", "stubs/", "scripts/", "types/"],
+    "editable_scope": [
+      "desktop/"
+    ],
+    "read_only_scope": [
+      "src/",
+      "stubs/",
+      "scripts/",
+      "types/"
+    ],
     "goal": "Turn the desktop/ wrapper into a small AI IDE powered by a hybrid OpenRouter+Ollama loop."
   },
   "architecture": {
     "frontend": {
       "path": "desktop/frontend",
-      "stack": ["vite", "react", "typescript"],
+      "stack": [
+        "vite",
+        "react",
+        "typescript"
+      ],
       "entry": "desktop/frontend/src/main.tsx",
       "build_output": "desktop/dist"
     },
     "backend": {
       "path": "desktop/src-tauri",
-      "stack": ["tauri@2", "tokio", "reqwest", "notify", "serde"],
+      "stack": [
+        "tauri@2",
+        "tokio",
+        "reqwest",
+        "notify",
+        "serde"
+      ],
       "entry": "desktop/src-tauri/src/lib.rs"
     },
     "ai_layer": {
@@ -34,25 +51,82 @@
     }
   },
   "tauri_commands": [
-    { "name": "list_dir",       "description": "Recursive shallow listing of a directory." },
-    { "name": "read_file",      "description": "Read a UTF-8 file under the opened project root." },
-    { "name": "write_file",     "description": "Write a UTF-8 file under the opened project root. Returns diff." },
-    { "name": "watch_dir",      "description": "Start a recursive notify watcher; emits fs:changed events." },
-    { "name": "unwatch_dir",    "description": "Stop a previously started watcher." },
-    { "name": "run_cmd",        "description": "Run a short shell command inside the opened project root (direct UI terminal)." },
-    { "name": "confirm_cmd",    "description": "Resolve an ai:confirm_request with approved=true|false." },
-    { "name": "send_chat",      "description": "Send a user message through the hybrid multi-agent loop (planner -> executor -> reviewer)." },
-    { "name": "cancel_chat",    "description": "Cancel the active chat loop." },
-    { "name": "get_settings",   "description": "Read persisted settings (api keys, models, base urls, safety, limits)." },
-    { "name": "save_settings",  "description": "Write persisted settings to the app config directory." },
-    { "name": "load_memory",    "description": "Load PROJECT_MEMORY.json from the opened project root." },
-    { "name": "save_memory",    "description": "Save PROJECT_MEMORY.json into the opened project root." },
-    { "name": "check_planner",  "description": "Health check: OpenRouter reachable with a key." },
-    { "name": "check_executor", "description": "Health check: Ollama reachable." },
-    { "name": "start_goal",       "description": "Autonomous: plan goal -> run tasks sequentially -> review/retry -> archive." },
-    { "name": "cancel_goal",      "description": "Cooperatively cancel the top-level autonomous goal loop." },
-    { "name": "scan_project_cmd", "description": "Scan the project (languages, entry points, configs, deps) and persist project_map." },
-    { "name": "load_task_tree",   "description": "Load the most-recently-persisted active task tree from PROJECT_MEMORY.json." }
+    {
+      "name": "list_dir",
+      "description": "Recursive shallow listing of a directory."
+    },
+    {
+      "name": "read_file",
+      "description": "Read a UTF-8 file under the opened project root."
+    },
+    {
+      "name": "write_file",
+      "description": "Write a UTF-8 file under the opened project root. Returns diff."
+    },
+    {
+      "name": "watch_dir",
+      "description": "Start a recursive notify watcher; emits fs:changed events."
+    },
+    {
+      "name": "unwatch_dir",
+      "description": "Stop a previously started watcher."
+    },
+    {
+      "name": "run_cmd",
+      "description": "Run a short shell command inside the opened project root (direct UI terminal)."
+    },
+    {
+      "name": "confirm_cmd",
+      "description": "Resolve an ai:confirm_request with approved=true|false."
+    },
+    {
+      "name": "send_chat",
+      "description": "Send a user message through the hybrid multi-agent loop (planner -> executor -> reviewer)."
+    },
+    {
+      "name": "cancel_chat",
+      "description": "Cancel the active chat loop."
+    },
+    {
+      "name": "get_settings",
+      "description": "Read persisted settings (api keys, models, base urls, safety, limits)."
+    },
+    {
+      "name": "save_settings",
+      "description": "Write persisted settings to the app config directory."
+    },
+    {
+      "name": "load_memory",
+      "description": "Load PROJECT_MEMORY.json from the opened project root."
+    },
+    {
+      "name": "save_memory",
+      "description": "Save PROJECT_MEMORY.json into the opened project root."
+    },
+    {
+      "name": "check_planner",
+      "description": "Health check: OpenRouter reachable with a key."
+    },
+    {
+      "name": "check_executor",
+      "description": "Health check: Ollama reachable."
+    },
+    {
+      "name": "start_goal",
+      "description": "Autonomous: plan goal -> run tasks sequentially -> review/retry -> archive."
+    },
+    {
+      "name": "cancel_goal",
+      "description": "Cooperatively cancel the top-level autonomous goal loop."
+    },
+    {
+      "name": "scan_project_cmd",
+      "description": "Scan the project (languages, entry points, configs, deps) and persist project_map."
+    },
+    {
+      "name": "load_task_tree",
+      "description": "Load the most-recently-persisted active task tree from PROJECT_MEMORY.json."
+    }
   ],
   "tool_schema": [
     {
@@ -60,8 +134,14 @@
       "description": "Read a text file relative to the opened project root.",
       "parameters": {
         "type": "object",
-        "properties": { "path": { "type": "string" } },
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     },
     {
@@ -70,10 +150,17 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
-          "content": { "type": "string" }
+          "path": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
         },
-        "required": ["path", "content"]
+        "required": [
+          "path",
+          "content"
+        ]
       }
     },
     {
@@ -81,8 +168,14 @@
       "description": "List files in a directory relative to the opened project root.",
       "parameters": {
         "type": "object",
-        "properties": { "path": { "type": "string" } },
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     },
     {
@@ -91,28 +184,140 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "cmd": { "type": "string" },
-          "timeout_ms": { "type": "integer" }
+          "cmd": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "type": "integer"
+          }
         },
-        "required": ["cmd"]
+        "required": [
+          "cmd"
+        ]
       }
     }
   ],
   "events": [
-    { "name": "ai:token",            "payload": { "text": "string", "role": "planner|executor|reviewer" } },
-    { "name": "ai:tool_call",        "payload": { "id": "string", "name": "string", "args": "object", "role": "planner|executor|reviewer" } },
-    { "name": "ai:tool_result",      "payload": { "id": "string", "ok": "boolean", "output": "string", "diff": "string|null", "role": "planner|executor|reviewer" } },
-    { "name": "ai:step",             "payload": { "index": "number", "role": "planner|executor|reviewer", "title": "string", "status": "running|done|failed" } },
-    { "name": "ai:confirm_request",  "payload": { "id": "string", "cmd": "string", "project_dir": "string", "timeout_ms": "number" } },
-    { "name": "ai:done",             "payload": { "assistant": "string", "iterations": "number" } },
-    { "name": "ai:error",            "payload": { "message": "string", "role": "planner|executor|reviewer|null" } },
-    { "name": "fs:changed",          "payload": { "path": "string", "kind": "created|modified|removed|renamed" } },
-    { "name": "project:scan_done",   "payload": { "languages": "string[]", "entry_points": "string[]", "configs": "string[]", "dependencies": "string[]", "file_count": "number" } },
-    { "name": "task:goal_started",   "payload": { "id": "string", "goal": "string", "task_count": "number", "created_at": "number" } },
-    { "name": "task:added",          "payload": { "goal_id": "string", "task": "Task" } },
-    { "name": "task:update",         "payload": { "goal_id": "string", "id": "string", "status": "pending|running|done|failed|skipped", "retries?": "number", "result?": "string|null", "updated_at?": "number", "retries_bumped?": "boolean" } },
-    { "name": "task:goal_done",      "payload": { "id": "string", "goal": "string", "status": "running|done|failed|cancelled", "completed": "number", "failed": "number" } },
-    { "name": "task:failure_logged", "payload": { "task_id": "string", "error": "string" } }
+    {
+      "name": "ai:token",
+      "payload": {
+        "text": "string",
+        "role": "planner|executor|reviewer"
+      }
+    },
+    {
+      "name": "ai:tool_call",
+      "payload": {
+        "id": "string",
+        "name": "string",
+        "args": "object",
+        "role": "planner|executor|reviewer"
+      }
+    },
+    {
+      "name": "ai:tool_result",
+      "payload": {
+        "id": "string",
+        "ok": "boolean",
+        "output": "string",
+        "diff": "string|null",
+        "role": "planner|executor|reviewer"
+      }
+    },
+    {
+      "name": "ai:step",
+      "payload": {
+        "index": "number",
+        "role": "planner|executor|reviewer",
+        "title": "string",
+        "status": "running|done|failed"
+      }
+    },
+    {
+      "name": "ai:confirm_request",
+      "payload": {
+        "id": "string",
+        "cmd": "string",
+        "project_dir": "string",
+        "timeout_ms": "number"
+      }
+    },
+    {
+      "name": "ai:done",
+      "payload": {
+        "assistant": "string",
+        "iterations": "number"
+      }
+    },
+    {
+      "name": "ai:error",
+      "payload": {
+        "message": "string",
+        "role": "planner|executor|reviewer|null"
+      }
+    },
+    {
+      "name": "fs:changed",
+      "payload": {
+        "path": "string",
+        "kind": "created|modified|removed|renamed"
+      }
+    },
+    {
+      "name": "project:scan_done",
+      "payload": {
+        "languages": "string[]",
+        "entry_points": "string[]",
+        "configs": "string[]",
+        "dependencies": "string[]",
+        "file_count": "number"
+      }
+    },
+    {
+      "name": "task:goal_started",
+      "payload": {
+        "id": "string",
+        "goal": "string",
+        "task_count": "number",
+        "created_at": "number"
+      }
+    },
+    {
+      "name": "task:added",
+      "payload": {
+        "goal_id": "string",
+        "task": "Task"
+      }
+    },
+    {
+      "name": "task:update",
+      "payload": {
+        "goal_id": "string",
+        "id": "string",
+        "status": "pending|running|done|failed|skipped",
+        "retries?": "number",
+        "result?": "string|null",
+        "updated_at?": "number",
+        "retries_bumped?": "boolean"
+      }
+    },
+    {
+      "name": "task:goal_done",
+      "payload": {
+        "id": "string",
+        "goal": "string",
+        "status": "running|done|failed|cancelled",
+        "completed": "number",
+        "failed": "number"
+      }
+    },
+    {
+      "name": "task:failure_logged",
+      "payload": {
+        "task_id": "string",
+        "error": "string"
+      }
+    }
   ],
   "session": {
     "turns": [],
@@ -175,7 +380,22 @@
       "Richer memory: file index, decision log",
       "Inline diff viewer in Execution pane",
       "run_cmd safety: allow-list + user-confirm dialog"
-    ]
+    ],
+    "pr_5": {
+      "url": null,
+      "title": "desktop: thread CancellationToken through tool + AI loop for mid-execution cancel",
+      "state": "pending-push",
+      "includes": [
+        "New cancel::CancelToken primitive (Arc<AtomicBool + Notify>) with lock-free is_cancelled(), async cancelled() future usable in tokio::select!, cheap Clone, reset(), link_from()",
+        "AppState.cancelled / goal_cancelled switched from Mutex<bool> to CancelToken",
+        "ai::cancel_chat -> state.cancelled.cancel(); run_chat_turn resets via state.cancelled.reset() and checks via is_cancelled()",
+        "controller::cancel_goal -> cancels both goal_cancelled and cancelled so in-flight turn aborts now, not next iteration",
+        "SSE readers in stream_openrouter / stream_ollama wrap stream.next() in tokio::select! vs cancel.cancelled(); on cancel drop reader + return Err(cancelled)",
+        "execute_run_cmd_gated races the confirm-modal oneshot against cancel.cancelled(); evicts pending confirm on cancel",
+        "run_cmd_impl child wait wrapped in select! against cancel; on cancel child.kill() then return Err(cancelled); pipe drains are cancel-aware too",
+        "Unit tests: 6 for CancelToken semantics + 3 for run_cmd mid-flight cancel (sleep 30 killed in <5s), pre-cancelled returns before completion, no-cancel happy path regression guard — 14/14 pass"
+      ]
+    }
   },
   "file_index": [],
   "tool_usage": {

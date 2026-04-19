@@ -114,9 +114,11 @@ pub async fn start_goal(
     }
     let _running_guard = RunningGuard(&state);
 
-    // Reset both cancellation flags for a fresh goal.
-    *state.cancelled.lock().unwrap() = false;
-    *state.goal_cancelled.lock().unwrap() = false;
+    // Reset both cancellation flags for a fresh goal. CancelToken.reset()
+    // clears the atomic flag without affecting pending waiters; since we
+    // are the only task about to await, this is the right moment.
+    state.cancelled.reset();
+    state.goal_cancelled.reset();
 
     // 1. Scan the project so the executor (and the user) has a map.
     let pmap = project_scan::scan_project(&project_dir);
@@ -205,8 +207,13 @@ pub async fn start_goal(
 
 #[tauri::command]
 pub fn cancel_goal(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    *state.goal_cancelled.lock().unwrap() = true;
-    *state.cancelled.lock().unwrap() = true;
+    // Trip both the goal token (observed between tasks) and the chat
+    // token (observed inside the in-flight turn). `cancel()` notifies
+    // every `cancelled()` awaiter so the SSE stream, the child process
+    // wait in `run_cmd`, and the confirm-modal race all unwind now
+    // instead of waiting for the next iteration boundary.
+    state.goal_cancelled.cancel();
+    state.cancelled.cancel();
     Ok(())
 }
 
@@ -229,7 +236,7 @@ async fn run_tasks(
     let mut consecutive_failures = 0u32;
 
     loop {
-        if *state.goal_cancelled.lock().unwrap() {
+        if state.goal_cancelled.is_cancelled() {
             tree.status = "cancelled".into();
             mark_unfinished(app, project_dir, tree, "cancelled by user");
             break;
@@ -401,7 +408,7 @@ async fn execute_task_with_retries(
     let mut last_feedback: Option<String> = None;
 
     loop {
-        if *state.goal_cancelled.lock().unwrap() {
+        if state.goal_cancelled.is_cancelled() {
             return TaskOutcome::Cancelled;
         }
 

@@ -41,6 +41,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
 
+use crate::cancel::CancelToken;
 use crate::{memory, tools, AppState, Settings};
 
 // Hard caps that protect the UI from runaway behavior even if the model
@@ -342,7 +343,11 @@ async fn stream_openrouter(
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
     role: Role,
+    cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
     if settings.openrouter_api_key.is_empty() {
         return Err("no OpenRouter API key".into());
     }
@@ -378,7 +383,20 @@ async fn stream_openrouter(
     let mut acc = StreamAccumulator::default();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // Race the next chunk against cancellation so we abort mid-stream,
+        // not just between frames. Dropping `resp` on cancel closes the
+        // underlying TCP connection so we don't keep billing tokens we'll
+        // never emit.
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                drop(stream);
+                return Err("cancelled".into());
+            }
+            c = stream.next() => c,
+        };
+        let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|e| e.to_string())?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // SSE frames are separated by a blank line.
@@ -437,7 +455,11 @@ async fn stream_ollama(
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
     role: Role,
+    cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
     let url = format!("{}/api/chat", settings.ollama_base_url.trim_end_matches('/'));
     let mut body = json!({
         "model": settings.ollama_model,
@@ -466,7 +488,16 @@ async fn stream_ollama(
     let mut acc = StreamAccumulator::default();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                drop(stream);
+                return Err("cancelled".into());
+            }
+            c = stream.next() => c,
+        };
+        let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|e| e.to_string())?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(idx) = buf.find('\n') {
@@ -512,9 +543,10 @@ async fn call_executor_with_fallback(
     messages: &[WireMessage],
     tools_schema: &Value,
     role: Role,
+    cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     // Executor path is always Ollama for now.
-    stream_ollama(app, settings, messages, Some(tools_schema), role).await
+    stream_ollama(app, settings, messages, Some(tools_schema), role, cancel).await
 }
 
 // ---------- Top-level commands ----------
@@ -541,7 +573,11 @@ pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, S
 
 #[tauri::command]
 pub fn cancel_chat(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    *state.cancelled.lock().unwrap() = true;
+    // Trip the cooperative cancel token. Wakes every `cancelled()` awaiter
+    // and makes subsequent `is_cancelled()` checks observe the cancel
+    // synchronously. The in-flight SSE stream and any running `run_cmd`
+    // child process will be torn down on the next `select!` poll.
+    state.cancelled.cancel();
     Ok(())
 }
 
@@ -556,6 +592,15 @@ pub async fn send_chat(
     run_chat_turn(app, &state, project_dir, message, history).await
 }
 
+/// A chat turn's cancel scope. Run-time callers (`send_chat`,
+/// controller) hand us a token to watch; we propagate it down to every
+/// SSE read and every `run_cmd` invocation so cancel takes effect
+/// mid-operation, not just between iterations.
+fn turn_cancel_token(state: &AppState) -> CancelToken {
+    // Callers reset the token at turn start; nothing else to do here.
+    state.cancelled.clone()
+}
+
 /// Runs a single multi-agent chat turn. Reusable by the higher-level
 /// autonomous controller (`controller::start_goal`), which does not own
 /// a `tauri::State` handle but does hold `&AppState`.
@@ -566,7 +611,11 @@ pub(crate) async fn run_chat_turn(
     message: String,
     history: Vec<UiMessage>,
 ) -> Result<ChatResponse, String> {
-    *state.cancelled.lock().unwrap() = false;
+    // Re-arm the per-turn cancel token. A prior `cancel_chat` press must
+    // not poison the next turn; the controller is responsible for not
+    // resetting when it wants cancellation to persist across tasks.
+    state.cancelled.reset();
+    let cancel = turn_cancel_token(state);
 
     let settings = state.settings.lock().unwrap().clone();
     let use_planner = !settings.openrouter_api_key.is_empty();
@@ -581,7 +630,7 @@ pub(crate) async fn run_chat_turn(
     // ---- Phase 1: Planner ----
     let plan_text: Option<String> = if use_planner {
         emit_step(&app, &mut steps, Role::Planner, "planning", "running");
-        match stream_openrouter(&app, &settings, None, &planner_messages(&history, &message), None, Role::Planner).await {
+        match stream_openrouter(&app, &settings, None, &planner_messages(&history, &message), None, Role::Planner, &cancel).await {
             Ok(msg) => {
                 let text = msg.content.clone().unwrap_or_default();
                 finish_step(&app, &mut steps, "done", Some(&first_line(&text)));
@@ -614,7 +663,7 @@ pub(crate) async fn run_chat_turn(
     'outer: loop {
         for iteration in 0..max_iterations {
             executor_iterations += 1;
-            if *state.cancelled.lock().unwrap() {
+            if cancel.is_cancelled() {
                 break 'outer;
             }
             emit_step(
@@ -624,7 +673,7 @@ pub(crate) async fn run_chat_turn(
                 &format!("executor step {}", iteration + 1),
                 "running",
             );
-            let reply = match call_executor_with_fallback(&app, &settings, &messages, &schema, Role::Executor).await {
+            let reply = match call_executor_with_fallback(&app, &settings, &messages, &schema, Role::Executor, &cancel).await {
                 Ok(m) => m,
                 Err(e) => {
                     finish_step(&app, &mut steps, "failed", Some(&truncate(&e, 120)));
@@ -683,7 +732,7 @@ pub(crate) async fn run_chat_turn(
 
                 let exec_result = match tc.function.name.as_str() {
                     "run_cmd" => {
-                        tools::execute_run_cmd_gated(&app, state, &project_dir, &args).await
+                        tools::execute_run_cmd_gated(&app, state, &project_dir, &args, &cancel).await
                     }
                     other => tools::execute_safe(&project_dir, other, &args).await,
                 };
@@ -732,9 +781,9 @@ pub(crate) async fn run_chat_turn(
         let review_messages = reviewer_messages(&message, &final_assistant, &all_tool_calls);
         // Reviewer prefers the planner (OpenRouter) if available, else executor.
         let review_result = if use_planner {
-            stream_openrouter(&app, &settings, None, &review_messages, None, Role::Reviewer).await
+            stream_openrouter(&app, &settings, None, &review_messages, None, Role::Reviewer, &cancel).await
         } else {
-            stream_ollama(&app, &settings, &review_messages, None, Role::Reviewer).await
+            stream_ollama(&app, &settings, &review_messages, None, Role::Reviewer, &cancel).await
         };
         let review_text = match review_result {
             Ok(m) => m.content.clone().unwrap_or_default(),
