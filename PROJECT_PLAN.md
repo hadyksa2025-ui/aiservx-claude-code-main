@@ -113,6 +113,24 @@ user prompt
 |    |   failures_log, project_map                          |             |
 | 21 | Intelligent retry per task (configurable, reviewer)  | done        |
 | 22 | UI task panel + autonomous-mode toggle               | done        |
+| 23 | Audit + hardening: retries, backoff, timeouts, CB    | done (PR #4)|
+| 24 | CancellationToken threaded through tool + AI loop    | done (PR #5)|
+| 25 | Subprocess tree-kill + CancelReason enum             | done (PR #6)|
+| 26 | Preserve CancelReason across run_cmd select!         | done (PR #7)|
+| 27 | Per-task execution trace (bounded transcript + UI)   | done (PR #8)|
+| 28 | Drop duplicate trace.push_assistant at end of turn   | done (PR #9)|
+| 29 | Optional confirm for irreversible ops in autonomous  | done (PR #10)|
+| 30 | Fix write-gate path bypass (fs_ops::resolve)         | done (PR #11)|
+| 31 | Phase closed by user: controlled autonomous system   | done        |
+
+### Intentionally out of scope (paused)
+
+- **Per-goal cost accounting.** Explicitly paused by the user: this is a
+  local-first system and token spend isn't a real constraint. No code landed
+  (the branch was dropped, there is no `cost.rs` in the tree). The design
+  notes above can be revived later as an optional feature; the current
+  system has bounded execution (timeouts + circuit breaker + retry caps)
+  even without it.
 
 ### 3.1 Blockers
 
@@ -346,8 +364,225 @@ Unit tests live next to the primitive and the runtime it plumbs into:
   starting.
 
 This is the "controlled" part of "controlled autonomous system".
-Follow-ups #6 (cost accounting), #7 (write-confirm opt-in), #8 (trace
-log) still pending.
+
+## 3.9 Subprocess tree-kill + `CancelReason` enum (PR #6)
+
+Direct extension of PR #5. Fixed two correctness gaps the audit called out.
+
+### Tree-kill
+
+- Children now spawn as **process group leaders**:
+  - Unix: `process_group(0)` (equivalent to `setpgid(0,0)` pre-exec).
+  - Windows: `CREATE_NEW_PROCESS_GROUP` flag (`creation_flags(0x200)`).
+- Cancel path is escalated:
+  - Unix: `SIGTERM` to the entire pgid → 200 ms grace → `SIGKILL` sweep.
+  - Windows: `child.kill()` → short wait → `taskkill /T /F /PID <pid>`.
+- Proven by a unit test that has the shell parent fork a `sleep 60 &`
+  grandchild, records the grandchild's pid to a tempfile, cancels, and
+  asserts `kill -0 <grandchild_pid>` fails. Previously that grandchild
+  outlived the cancel.
+
+### `CancelReason`
+
+- Enum `User | Goal | Timeout | CircuitOpen`.
+- Additive: `cancel()` still works (defaults to `User`); error strings
+  still start with `"cancelled"` so existing substring checks keep
+  working. New `cancel_with_reason(reason)` and `reason() -> Option<_>`
+  let the UI and memory log *why* a cancel happened.
+- Threaded through the `tokio::select!` races so the reason the token
+  was cancelled for is the reason the caller sees, even if multiple
+  cancels fire near-simultaneously (see PR #7 fix below).
+
+### Extra test: SSE cancel under load
+
+- Extracted the SSE-consume loop to a helper
+  `consume_sse_with_cancel<S>(...)` and tested it against an `mpsc`-backed
+  stream that never completes on its own — verifies cancel unblocks the
+  reader within 200 ms instead of waiting for the stream to end.
+
+## 3.10 Preserve `CancelReason` across `run_cmd` select! (PR #7)
+
+A 🟡 Devin Review finding on PR #6. The cancel-error string in
+`run_cmd_impl` was being computed *before* the `select!` arm fired, so if
+a mid-flight cancel landed after the string was built but before the
+child exited, the returned error collapsed back to the bare `"cancelled"`
+string and lost the reason (`Timeout`, `CircuitOpen`, etc.).
+
+Fix: compute the error string *inside* the cancel arm, reading
+`cancel.reason()` at the moment the cancel is observed. New regression
+test `run_cmd_mid_flight_cancel_preserves_reason` asserts the returned
+error string contains the specific reason suffix.
+
+`cargo test --lib`: **23/23 pass** after this PR.
+
+## 3.11 Per-task execution trace (PR #8)
+
+Audit follow-up #8. Every goal-driven task now carries a bounded
+transcript so you can re-read exactly what the agent did, including
+across a full restart.
+
+### Schema (`trace.rs`)
+
+```rust
+pub struct Trace {
+    pub entries: Vec<TraceEntry>,   // bounded: MAX_ENTRIES = 256
+    pub truncated: bool,            // true once the cap was hit
+}
+pub enum TraceEntry {
+    User { text: String },          // capped to 4 KiB
+    System { text: String },
+    Planner { text: String },
+    Executor { text: String },
+    Reviewer { text: String, verdict: Option<ReviewVerdict> },
+    ToolCall  { id, name, args },   // args capped per value
+    ToolResult{ id, ok, output, diff },  // output and diff capped
+    Retry     { attempt, reason },
+    Error     { message, role },
+}
+```
+
+- Per-string caps keep the serialized trace under control even for
+  multi-MB tool outputs (e.g. `cargo build`).
+- `ReviewVerdict { Ok | NeedsFix(instruction) }` is round-tripped so
+  the UI can render the reviewer's reasoning.
+
+### Wiring
+
+- `Task` struct gains `trace: Trace`.
+- `ai::run_chat_turn` accepts `Option<&mut Trace>` and pushes entries
+  at every meaningful event (prompt sent, tool call issued, tool
+  result received, reviewer verdict, error).
+- `controller` passes the task's trace into the turn and persists the
+  tree (and therefore the trace) on every `task:update`.
+- Memory archives the trace with the task into `task_history[]`, so
+  reopening the app shows the trace for every completed / failed /
+  cancelled task in the history.
+
+### UI
+
+- Each task in `TaskPanel` gets an **expandable Trace** section.
+- Role-coloured messages reusing the chat bubble styles.
+- Tool calls + tool results rendered with the existing Execution
+  renderer (including inline diffs).
+- Retry markers and errors surfaced distinctly.
+
+### Tests
+
+- Trace entries serialize round-trip.
+- Entry count is capped at `MAX_ENTRIES`; `truncated` flips true.
+- Per-entry string cap enforced.
+- `ReviewVerdict` round-trips through JSON.
+
+## 3.12 Drop duplicate `trace.push_assistant` at end of turn (PR #9)
+
+A 🟡 Devin Review finding on PR #8: `run_chat_turn` pushed the final
+executor assistant message *twice* — once from the streaming loop as
+tokens arrived, once again from the consolidated assistant message at
+the end of the turn. Every trace in the wild had a duplicated last
+executor block.
+
+Fix: remove the trailing `push_assistant` — the streaming loop already
+wrote the exact same text. 3-line change, 32/32 cargo tests still
+green.
+
+## 3.13 Optional confirm for irreversible ops in autonomous mode (PR #10)
+
+Audit follow-up #7. Default is `false`; chat-driven turns are
+unaffected regardless. When `autonomous_mode=true` **and**
+`autonomous_confirm_irreversible=true`:
+
+- `write_file` routes through the confirm modal *only* when the target
+  already exists and the new content differs. Creates and no-op
+  rewrites go through without a prompt.
+- `run_cmd` routes through the confirm modal *always*, even for
+  commands on the user's allow-list. The allow-list is the auto-path
+  during interactive chat; this setting is the "really auto" escape
+  hatch during autonomous goals.
+- Deny → task fails with a `cancelled by user` trace entry, cancel
+  path tears the rest of the turn down cleanly.
+- Timeout on the modal (10 min) → task fails with a `timeout` trace
+  entry so the autonomous loop doesn't hang.
+
+### Tests
+
+- Setting off → no prompt (regression guard for current autonomous
+  behaviour).
+- Setting on + allow → tool runs normally.
+- Setting on + deny → task fails + trace carries the error.
+- Setting on + timeout → task fails with timeout reason.
+- Write gate unit tests: create is not destructive, identical-content
+  rewrite is no-op, changed content is destructive.
+
+## 3.14 Fix write-gate path bypass (PR #11)
+
+A 🔴 Devin Review finding on PR #10. The destructive-write gate
+(`write_would_change_existing_file`) resolved the target via
+`Path::new(project_dir).join(sub_path)`, but the actual write via
+`fs_ops::write_file` resolves through `fs_ops::resolve`, which **strips
+leading separators** before joining. `std::path::Path::join` on an
+absolute `sub_path` replaces the base entirely, so the two resolvers
+disagreed for any path that started with `/`:
+
+- Gate check for `/src/foo.rs` → looks at `/src/foo.rs` at the fs root
+  → doesn't exist → `Some(false)` → **no prompt**.
+- Actual write → leading `/` stripped → overwrites the real
+  `{project_dir}/src/foo.rs`.
+
+That is exactly the destructive overwrite `autonomous_confirm_irreversible`
+is supposed to catch.
+
+### Fix
+
+Resolve the check path through the **same** `fs_ops::resolve` helper
+the real write uses. On `Err` (sandbox escape, bad root) return
+`Some(false)` — the real `write_file` call will reject the path
+anyway, so there's no meaningful confirmation to collect.
+
+### Tests
+
+- `write_gate_leading_slash_matches_fs_ops_resolution` — seeds
+  `{tmp}/src/foo.rs`, calls the gate with `/src/foo.rs` + new content,
+  asserts `Some(true)`. Fails on the pre-fix implementation.
+- `write_gate_sandbox_escape_does_not_prompt` — `../../…/etc/passwd`
+  path must return `Some(false)`.
+
+`cargo test --lib`: **42/42 pass.**
+
+## 3.15 Phase closed
+
+The controlled autonomous system is considered feature-complete for
+local-first usage. Current guarantees:
+
+- **Control.** Cancel is observable mid-SSE, mid-subprocess, and
+  between tasks. Tree-kill on Unix + Windows. Typed cancel reasons
+  flow to UI and trace.
+- **Safety.** Deny-list → allow-list → confirm-modal gate on every
+  `run_cmd`. Optional `autonomous_confirm_irreversible` for
+  `write_file` + `run_cmd` during autonomous goals. Path sandbox
+  enforced by a single `fs_ops::resolve` everywhere (including the
+  confirm gate).
+- **Bounded execution.** Per-task timeout, global goal timeout,
+  per-task retry cap, consecutive-failure circuit breaker,
+  bounded-size memory file with atomic writes.
+- **Traceability.** Every goal-driven task persists a bounded,
+  schema-versioned transcript of prompts, tool calls, tool results,
+  retries, and errors. Survives restart via
+  `PROJECT_MEMORY.json → task_history[]`.
+
+### Optional follow-ups (not committed)
+
+These are ideas, not commitments. None of them block the current system.
+
+- Per-goal cost accounting (paused by user).
+- Parallel task execution (current `max_parallel_tasks=1`, scaffold
+  is already there).
+- LSP/code-intelligence integration for better editor-like context.
+- Structured planner JSON schema enforced at the Ollama side (today
+  we parse + heuristically fall back).
+- Memory compaction when `task_history[]` approaches 4 MiB — currently
+  we cap count (200), not bytes.
+- Multi-file diff viewer in the Execution pane.
+- Plugin system for custom tools.
 
 ## 4. Design Decisions
 
@@ -379,24 +614,35 @@ log) still pending.
   via a simple `save_settings` command).
 - Windows installer tuning; we only guarantee `cargo tauri dev` works.
 
-## 6. How to run
+## 6. How to run (local-first)
+
+Prerequisites: Node ≥ 18, Rust stable, Ollama running locally, Linux/macOS
+Tauri v2 system deps (`webkit2gtk-4.1`, `libsoup-3.0`, etc. on Linux; WebView2
+on Windows).
 
 ```bash
-# prerequisites: Node >= 18, Rust stable, Ollama (optional), OpenRouter key (optional)
+# 1. Ollama + the models this project is exercised against locally
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
 
+ollama pull deepseek-coder:6.7b    # strong executor for code tasks
+ollama pull qwen2.5:latest         # generalist executor / reviewer
+ollama pull llama3.2:1b            # fast, small reviewer
+
+# 2. Build the frontend
 cd desktop/frontend
 npm install
-npm run build         # produces desktop/dist/index.html + assets
+npm run build                      # writes desktop/dist/
 
-# then either:
+# 3. Start the desktop app
 cd ../src-tauri
-cargo tauri dev       # dev mode
-
-# or for a headless smoke-check of the Rust side:
+cargo tauri dev                    # full desktop app
+# or headless smoke-check the Rust side:
 cargo check
+cargo test --lib
 ```
 
-Environment variables:
+Environment variables (optional; the Settings UI is the canonical path):
 
 | Variable            | Purpose                                    | Default                       |
 |---------------------|--------------------------------------------|-------------------------------|
@@ -405,5 +651,16 @@ Environment variables:
 | `OLLAMA_BASE_URL`   | Ollama base url                            | `http://localhost:11434`      |
 | `OLLAMA_MODEL`      | Executor model                             | `llama3.1:8b`                 |
 
-Settings can also be set at runtime via the UI and are persisted to the
-standard app-config directory.
+Settings persist to the standard app-config directory
+(`~/.config/open-claude-code/settings.json` on Linux).
+
+### Recommended pairing for 8 GB-RAM laptops
+
+- Executor: `deepseek-coder:6.7b` (~4 GB) — strong at code, emits correct
+  tool-call JSON reliably.
+- Reviewer: `llama3.2:1b` (~1.3 GB) — the reviewer only has to produce
+  `OK:` / `NEEDS_FIX: …` verdicts, a 1B model is accurate enough and
+  fits alongside the executor without swapping.
+
+Swap in `qwen2.5:latest` for either role when you want more generalist
+reasoning and have the RAM headroom.

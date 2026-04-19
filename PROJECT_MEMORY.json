@@ -1,10 +1,14 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-04-19T03:55:00Z",
+  "updated_at": "2026-04-19T04:10:00Z",
   "project": {
     "root": "open-claude-code-main",
     "editable_scope": [
-      "desktop/"
+      "desktop/",
+      "docs/",
+      "README.md",
+      "PROJECT_PLAN.md",
+      "PROJECT_MEMORY.json"
     ],
     "read_only_scope": [
       "src/",
@@ -12,7 +16,7 @@
       "scripts/",
       "types/"
     ],
-    "goal": "Turn the desktop/ wrapper into a small AI IDE powered by a hybrid OpenRouter+Ollama loop."
+    "goal": "A controlled autonomous coding system: Planner -> Executor -> Reviewer loop driven by an autonomous controller, with mid-flight cancel, subprocess tree-kill, per-task execution trace, and optional confirm on irreversible ops. Local-first via Ollama; OpenRouter optional."
   },
   "architecture": {
     "frontend": {
@@ -34,291 +38,152 @@
         "notify",
         "serde"
       ],
-      "entry": "desktop/src-tauri/src/lib.rs"
+      "entry": "desktop/src-tauri/src/lib.rs",
+      "modules": {
+        "ai.rs": "Planner/Executor/Reviewer streaming loop, run_chat_turn reusable by controller",
+        "cancel.rs": "CancelToken primitive + CancelReason enum (User/Goal/Timeout/CircuitOpen), async cancelled() future, link_from() propagator",
+        "controller.rs": "start_goal top-level autonomous loop; plan -> execute -> review -> retry -> archive; enforces task/goal timeouts and circuit breaker",
+        "fs_ops.rs": "path sandbox (resolve strips leading separators, walks .. virtually, canonicalizes, rejects escapes)",
+        "memory.rs": "atomic temp-file + rename PROJECT_MEMORY.json writes, size ceiling 4 MiB, schema_version = 2, migrate_memory()",
+        "project_scan.rs": "languages / entry points / configs / deps / workspace detection",
+        "settings.rs": "Settings struct (persisted to OS config dir), get_settings/save_settings commands",
+        "tasks.rs": "TaskTree with bounded per-task Trace, persistence to memory, emit helpers for task:* events",
+        "tools.rs": "read_file/write_file/list_dir/run_cmd with gating (deny-list, allow-list, confirm modal, autonomous_confirm_irreversible), subprocess tree-kill (process_group on Unix, CREATE_NEW_PROCESS_GROUP on Windows, SIGTERM->SIGKILL escalation)",
+        "trace.rs": "bounded Trace schema (MAX_ENTRIES=256, per-string caps), ReviewVerdict",
+        "watcher.rs": "debounced notify file watcher, emits fs:changed"
+      }
     },
     "ai_layer": {
       "planner": {
         "provider": "openrouter",
         "default_model": "openrouter/auto",
-        "endpoint": "https://openrouter.ai/api/v1/chat/completions"
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+        "required": false
       },
       "executor": {
         "provider": "ollama",
         "default_model": "llama3.1:8b",
-        "endpoint_suffix": "/api/chat"
+        "endpoint_suffix": "/api/chat",
+        "required": true
+      },
+      "reviewer": {
+        "provider": "ollama",
+        "default_model": "llama3.1:8b",
+        "endpoint_suffix": "/api/chat",
+        "required": false,
+        "toggled_via": "settings.reviewer_enabled"
+      },
+      "recommended_local_models": {
+        "executor": "deepseek-coder:6.7b",
+        "reviewer": "llama3.2:1b",
+        "generalist_alternative": "qwen2.5:latest"
       },
       "fallback_policy": "If planner fails or OPENROUTER_API_KEY missing, executor handles end-to-end."
     }
   },
+  "settings_surface": {
+    "openrouter_api_key": "string (optional; enables planner)",
+    "openrouter_model": "string (default: openrouter/auto)",
+    "ollama_base_url": "string (default: http://localhost:11434)",
+    "ollama_model": "string (default: llama3.1:8b)",
+    "reviewer_enabled": "boolean (default: true)",
+    "max_iterations": "u32 executor-loop cap per turn (default: 8, hard ceiling 16)",
+    "cmd_confirm_required": "boolean (default: true) — gate run_cmd via confirm modal when not allow-listed",
+    "cmd_allow_list": "Vec<String> of command prefixes auto-approved without modal",
+    "autonomous_mode": "boolean (default: false) — controller runs without user intervention between tasks",
+    "max_retries_per_task": "u32 (default: 3)",
+    "max_total_tasks": "u32 planner cap (default: 20)",
+    "task_timeout_secs": "u64 per-task wall clock (default: 180, 0 disables)",
+    "goal_timeout_secs": "u64 global (default: 3600, 0 disables)",
+    "retry_backoff_base_ms": "u64 exponential backoff base (default: 1000; capped at 30s)",
+    "circuit_breaker_threshold": "u32 consecutive failures (default: 5, 0 disables)",
+    "max_parallel_tasks": "u32 (default: 1; scaffold for future parallel runs)",
+    "autonomous_confirm_irreversible": "boolean (default: false) — forces confirm modal on write_file (existing-file changes) and run_cmd even when autonomous_mode=true"
+  },
   "tauri_commands": [
-    {
-      "name": "list_dir",
-      "description": "Recursive shallow listing of a directory."
-    },
-    {
-      "name": "read_file",
-      "description": "Read a UTF-8 file under the opened project root."
-    },
-    {
-      "name": "write_file",
-      "description": "Write a UTF-8 file under the opened project root. Returns diff."
-    },
-    {
-      "name": "watch_dir",
-      "description": "Start a recursive notify watcher; emits fs:changed events."
-    },
-    {
-      "name": "unwatch_dir",
-      "description": "Stop a previously started watcher."
-    },
-    {
-      "name": "run_cmd",
-      "description": "Run a short shell command inside the opened project root (direct UI terminal)."
-    },
-    {
-      "name": "confirm_cmd",
-      "description": "Resolve an ai:confirm_request with approved=true|false."
-    },
-    {
-      "name": "send_chat",
-      "description": "Send a user message through the hybrid multi-agent loop (planner -> executor -> reviewer)."
-    },
-    {
-      "name": "cancel_chat",
-      "description": "Cancel the active chat loop."
-    },
-    {
-      "name": "get_settings",
-      "description": "Read persisted settings (api keys, models, base urls, safety, limits)."
-    },
-    {
-      "name": "save_settings",
-      "description": "Write persisted settings to the app config directory."
-    },
-    {
-      "name": "load_memory",
-      "description": "Load PROJECT_MEMORY.json from the opened project root."
-    },
-    {
-      "name": "save_memory",
-      "description": "Save PROJECT_MEMORY.json into the opened project root."
-    },
-    {
-      "name": "check_planner",
-      "description": "Health check: OpenRouter reachable with a key."
-    },
-    {
-      "name": "check_executor",
-      "description": "Health check: Ollama reachable."
-    },
-    {
-      "name": "start_goal",
-      "description": "Autonomous: plan goal -> run tasks sequentially -> review/retry -> archive."
-    },
-    {
-      "name": "cancel_goal",
-      "description": "Cooperatively cancel the top-level autonomous goal loop."
-    },
-    {
-      "name": "scan_project_cmd",
-      "description": "Scan the project (languages, entry points, configs, deps) and persist project_map."
-    },
-    {
-      "name": "load_task_tree",
-      "description": "Load the most-recently-persisted active task tree from PROJECT_MEMORY.json."
-    }
+    { "name": "list_dir", "description": "Recursive shallow listing of a directory." },
+    { "name": "read_file", "description": "Read a UTF-8 file under the opened project root." },
+    { "name": "write_file", "description": "Write a UTF-8 file under the opened project root. Returns diff." },
+    { "name": "watch_dir", "description": "Start a recursive notify watcher; emits fs:changed events." },
+    { "name": "unwatch_dir", "description": "Stop a previously started watcher." },
+    { "name": "run_cmd", "description": "Run a short shell command inside the opened project root (direct UI terminal)." },
+    { "name": "confirm_cmd", "description": "Resolve an ai:confirm_request with approved=true|false." },
+    { "name": "send_chat", "description": "Send a user message through the hybrid multi-agent loop (planner -> executor -> reviewer)." },
+    { "name": "cancel_chat", "description": "Cancel the active chat loop; propagates CancelReason::User through the token." },
+    { "name": "get_settings", "description": "Read persisted settings (api keys, models, base urls, safety, limits)." },
+    { "name": "save_settings", "description": "Write persisted settings to the app config directory." },
+    { "name": "load_memory", "description": "Load PROJECT_MEMORY.json from the opened project root." },
+    { "name": "save_memory", "description": "Save PROJECT_MEMORY.json into the opened project root (atomic)." },
+    { "name": "check_planner", "description": "Health check: OpenRouter reachable with a key." },
+    { "name": "check_executor", "description": "Health check: Ollama reachable." },
+    { "name": "start_goal", "description": "Autonomous: plan goal -> run tasks sequentially -> review/retry -> archive." },
+    { "name": "cancel_goal", "description": "Cooperatively cancel the top-level autonomous goal loop; CancelReason::Goal." },
+    { "name": "scan_project_cmd", "description": "Scan the project (languages, entry points, configs, deps) and persist project_map." },
+    { "name": "load_task_tree", "description": "Load the most-recently-persisted active task tree from PROJECT_MEMORY.json." }
   ],
   "tool_schema": [
     {
       "name": "read_file",
       "description": "Read a text file relative to the opened project root.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ]
-      }
+      "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
     },
     {
       "name": "write_file",
-      "description": "Write a text file relative to the opened project root. Overwrites.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
-          },
-          "content": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path",
-          "content"
-        ]
-      }
+      "description": "Write a text file relative to the opened project root. Overwrites. Destructive-write gate uses fs_ops::resolve so leading-slash paths cannot bypass autonomous_confirm_irreversible.",
+      "parameters": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] }
     },
     {
       "name": "list_dir",
       "description": "List files in a directory relative to the opened project root.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ]
-      }
+      "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
     },
     {
       "name": "run_cmd",
-      "description": "Run a short shell command inside the opened project root. Returns stdout+stderr.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "cmd": {
-            "type": "string"
-          },
-          "timeout_ms": {
-            "type": "integer"
-          }
-        },
-        "required": [
-          "cmd"
-        ]
-      }
+      "description": "Run a short shell command inside the opened project root. Children spawn in a new process group; cancel tears down the whole tree.",
+      "parameters": { "type": "object", "properties": { "cmd": { "type": "string" }, "timeout_ms": { "type": "integer" } }, "required": ["cmd"] }
     }
   ],
   "events": [
-    {
-      "name": "ai:token",
-      "payload": {
-        "text": "string",
-        "role": "planner|executor|reviewer"
-      }
-    },
-    {
-      "name": "ai:tool_call",
-      "payload": {
-        "id": "string",
-        "name": "string",
-        "args": "object",
-        "role": "planner|executor|reviewer"
-      }
-    },
-    {
-      "name": "ai:tool_result",
-      "payload": {
-        "id": "string",
-        "ok": "boolean",
-        "output": "string",
-        "diff": "string|null",
-        "role": "planner|executor|reviewer"
-      }
-    },
-    {
-      "name": "ai:step",
-      "payload": {
-        "index": "number",
-        "role": "planner|executor|reviewer",
-        "title": "string",
-        "status": "running|done|failed"
-      }
-    },
-    {
-      "name": "ai:confirm_request",
-      "payload": {
-        "id": "string",
-        "cmd": "string",
-        "project_dir": "string",
-        "timeout_ms": "number"
-      }
-    },
-    {
-      "name": "ai:done",
-      "payload": {
-        "assistant": "string",
-        "iterations": "number"
-      }
-    },
-    {
-      "name": "ai:error",
-      "payload": {
-        "message": "string",
-        "role": "planner|executor|reviewer|null"
-      }
-    },
-    {
-      "name": "fs:changed",
-      "payload": {
-        "path": "string",
-        "kind": "created|modified|removed|renamed"
-      }
-    },
-    {
-      "name": "project:scan_done",
-      "payload": {
-        "languages": "string[]",
-        "entry_points": "string[]",
-        "configs": "string[]",
-        "dependencies": "string[]",
-        "file_count": "number"
-      }
-    },
-    {
-      "name": "task:goal_started",
-      "payload": {
-        "id": "string",
-        "goal": "string",
-        "task_count": "number",
-        "created_at": "number"
-      }
-    },
-    {
-      "name": "task:added",
-      "payload": {
-        "goal_id": "string",
-        "task": "Task"
-      }
-    },
-    {
-      "name": "task:update",
-      "payload": {
-        "goal_id": "string",
-        "id": "string",
-        "status": "pending|running|done|failed|skipped",
-        "retries?": "number",
-        "result?": "string|null",
-        "updated_at?": "number",
-        "retries_bumped?": "boolean"
-      }
-    },
-    {
-      "name": "task:goal_done",
-      "payload": {
-        "id": "string",
-        "goal": "string",
-        "status": "running|done|failed|cancelled",
-        "completed": "number",
-        "failed": "number"
-      }
-    },
-    {
-      "name": "task:failure_logged",
-      "payload": {
-        "task_id": "string",
-        "error": "string"
-      }
-    }
+    { "name": "ai:token", "payload": { "text": "string", "role": "planner|executor|reviewer" } },
+    { "name": "ai:tool_call", "payload": { "id": "string", "name": "string", "args": "object", "role": "planner|executor|reviewer" } },
+    { "name": "ai:tool_result", "payload": { "id": "string", "ok": "boolean", "output": "string", "diff": "string|null", "role": "planner|executor|reviewer" } },
+    { "name": "ai:step", "payload": { "index": "number", "role": "planner|executor|reviewer", "title": "string", "status": "running|done|failed" } },
+    { "name": "ai:confirm_request", "payload": { "id": "string", "cmd": "string", "project_dir": "string", "timeout_ms": "number", "kind": "run_cmd|write_file" } },
+    { "name": "ai:done", "payload": { "assistant": "string", "iterations": "number" } },
+    { "name": "ai:error", "payload": { "message": "string", "role": "planner|executor|reviewer|null" } },
+    { "name": "ai:info", "payload": { "code": "circuit_open|goal_timeout|…", "message": "string" } },
+    { "name": "fs:changed", "payload": { "path": "string", "kind": "created|modified|removed|renamed" } },
+    { "name": "project:scan_done", "payload": { "languages": "string[]", "entry_points": "string[]", "configs": "string[]", "dependencies": "string[]", "file_count": "number", "workspace": "boolean", "scan_ms": "number", "truncated": "boolean" } },
+    { "name": "task:goal_started", "payload": { "id": "string", "goal": "string", "task_count": "number", "created_at": "number" } },
+    { "name": "task:added", "payload": { "goal_id": "string", "task": "Task (includes bounded trace)" } },
+    { "name": "task:update", "payload": { "goal_id": "string", "id": "string", "status": "pending|running|done|failed|cancelled|skipped", "retries?": "number", "result?": "string|null", "updated_at?": "number", "retries_bumped?": "boolean", "trace?": "Trace" } },
+    { "name": "task:goal_done", "payload": { "id": "string", "goal": "string", "status": "running|done|failed|cancelled|timeout|circuit_open", "completed": "number", "failed": "number" } },
+    { "name": "task:failure_logged", "payload": { "task_id": "string", "error": "string" } }
   ],
+  "trace_schema": {
+    "bounded_by": "MAX_ENTRIES = 256, truncated flag flips true once exceeded",
+    "per_string_cap": "4 KiB per user/system/planner/executor/reviewer message; tool outputs and diffs capped similarly",
+    "entries": [
+      "User { text }",
+      "System { text }",
+      "Planner { text }",
+      "Executor { text }",
+      "Reviewer { text, verdict: Ok | NeedsFix(instruction) }",
+      "ToolCall { id, name, args }",
+      "ToolResult { id, ok, output, diff }",
+      "Retry { attempt, reason }",
+      "Error { message, role }"
+    ],
+    "persistence": "Attached to each Task; persisted inside active_task_tree and task_history[] on every task:update and on goal completion."
+  },
+  "cancel_behavior": {
+    "token": "cancel::CancelToken (Arc<Inner> with AtomicBool + Notify)",
+    "reasons": ["User", "Goal", "Timeout", "CircuitOpen"],
+    "mid_sse": "stream_openrouter and stream_ollama wrap stream.next() in tokio::select! against cancel.cancelled(); drop reader + return Err(cancelled:<reason>)",
+    "mid_subprocess": "run_cmd_impl races cancel.cancelled() vs child.wait(); on cancel, process-group signal escalation (SIGTERM -> 200ms grace -> SIGKILL on Unix; child.kill() -> taskkill /T /F sweep on Windows)",
+    "subprocess_tree_kill": "Children spawn with process_group(0) on Unix / CREATE_NEW_PROCESS_GROUP on Windows; grandchildren killed by pgid/job. Verified by shell-parent-forks-sleep-60& grandchild test.",
+    "reason_preservation": "error string is computed inside the cancel arm, not before the select!, so the reason reaches the caller even under multi-cancel races (PR #7 fix)"
+  },
   "session": {
     "turns": [],
     "opened_project": null
@@ -328,74 +193,30 @@
   "failures_log": [],
   "project_map": null,
   "delivery_status": {
-    "pr_1": {
-      "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1",
-      "title": "desktop: AI IDE foundation — React SPA + Tauri v2 backend + hybrid AI loop",
-      "state": "merged",
-      "ci": "green (no GitHub Actions; Devin Review passed)",
-      "includes": [
-        "React SPA (Vite + React 18 + TS)",
-        "Tauri v2 commands: list_dir, read_file, write_file, watch_dir, run_cmd, send_chat, settings, memory",
-        "Hybrid AI loop (OpenRouter planner + Ollama executor) with graceful fallback",
-        "Persistent PROJECT_MEMORY.json writes from Rust",
-        "PROJECT_PLAN.md + PROJECT_MEMORY.json docs"
-      ]
-    },
-    "pr_2": {
-      "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/2",
-      "title": "desktop: streaming + reviewer agent + cmd safety + richer memory",
-      "state": "merged",
-      "includes": [
-        "Real SSE streaming from OpenRouter and Ollama (ai:token with role)",
-        "Three-agent loop: Planner -> Executor (bounded iterations) -> Reviewer (1 corrective NEEDS_FIX retry)",
-        "Hard ceiling of 16 executor iterations per turn; per-settings limit",
-        "Command safety: built-in deny-list + user allow-list + ai:confirm_request gate with 10-min timeout",
-        "Richer memory: session turns, tool_usage counters, file_index (bounded 500), decisions (bounded 100)",
-        "UI: streaming chat bubbles per role, role chips, step timeline, inline colored diffs, confirm modal",
-        "Settings UI: reviewer toggle, max_iterations, cmd_confirm_required, cmd_allow_list editor"
-      ]
-    },
-    "pr_3": {
-      "url": null,
-      "title": "desktop: autonomous task engine — goal planner, controller, project scanner, task UI",
-      "state": "pending-push",
-      "includes": [
-        "New backend modules: tasks.rs (TaskTree schema + persistence), project_scan.rs (language/entry-point/config/deps detection), controller.rs (goal -> plan -> execute -> review -> retry loop)",
-        "New Tauri commands: start_goal, cancel_goal, scan_project_cmd, load_task_tree",
-        "AppState.goal_cancelled: separate flag from per-turn cancel",
-        "Settings: autonomous_mode, max_retries_per_task (default 3), max_total_tasks (default 20)",
-        "PROJECT_MEMORY.json: active_task_tree, task_history (cap 200), failures_log (cap 200), project_map",
-        "ai::run_chat_turn: reusable multi-agent turn exposed to the controller",
-        "Events: project:scan_done, task:goal_started, task:added, task:update, task:goal_done, task:failure_logged",
-        "Frontend: new TaskPanel component (goal input, task list w/ status chips, progress bar, retries, result), 4-pane layout, autonomous-mode toggle + retry/total caps in Settings"
-      ]
-    },
-    "blockers": [
-      "Extraction of logic from src/ is paused pending written Anthropic authorization."
+    "phase": "closed",
+    "phase_summary": "Controlled autonomous system complete: mid-flight cancel (SSE + subprocess), subprocess tree-kill, typed CancelReason, per-task execution trace, optional confirm for irreversible ops, bounded execution (timeouts/retries/circuit-breaker), sandbox-enforced writes (single fs_ops::resolve everywhere).",
+    "pr_1": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1", "state": "merged", "title": "desktop: AI IDE foundation" },
+    "pr_2": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/2", "state": "merged", "title": "desktop: streaming + reviewer agent + cmd safety + richer memory" },
+    "pr_3": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/3", "state": "merged", "title": "desktop: autonomous task engine" },
+    "pr_4": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/4", "state": "merged", "title": "desktop: audit + harden autonomous task engine (retries, backoff, timeouts, circuit breaker)" },
+    "pr_5": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/5", "state": "merged", "title": "desktop: thread CancellationToken through tool + AI loop for mid-execution cancel" },
+    "pr_6": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/6", "state": "merged", "title": "desktop: CancelReason enum + subprocess tree-kill (pgid at spawn, TERM->KILL escalation)" },
+    "pr_7": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/7", "state": "merged", "title": "desktop: preserve CancelReason across run_cmd select! (addresses PR #6 Devin Review)" },
+    "pr_8": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/8", "state": "merged", "title": "desktop: per-task execution trace (bounded transcript + UI)" },
+    "pr_9": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/9", "state": "merged", "title": "desktop: drop duplicate trace.push_assistant at end of run_chat_turn (addresses PR #8 Devin Review)" },
+    "pr_10": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/10", "state": "merged", "title": "desktop: autonomous_confirm_irreversible setting — force confirm modal for irreversible ops" },
+    "pr_11": { "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/11", "state": "merged", "title": "desktop: fix write-gate path bypass in autonomous_confirm_irreversible (addresses PR #10 Devin Review)" },
+    "paused": [
+      "Per-goal cost accounting (#4 in the original follow-up queue): local-first, not a real requirement right now. No code landed; no cost.rs module exists in tree."
     ],
-    "next_clean_room_phases": [
-      "Streaming tokens (SSE) from OpenRouter + Ollama to ai:token events",
-      "Reviewer agent: plan -> execute -> review -> fix",
-      "Autonomous retry loop with bounded iterations",
-      "Richer memory: file index, decision log",
-      "Inline diff viewer in Execution pane",
-      "run_cmd safety: allow-list + user-confirm dialog"
-    ],
-    "pr_5": {
-      "url": null,
-      "title": "desktop: thread CancellationToken through tool + AI loop for mid-execution cancel",
-      "state": "pending-push",
-      "includes": [
-        "New cancel::CancelToken primitive (Arc<AtomicBool + Notify>) with lock-free is_cancelled(), async cancelled() future usable in tokio::select!, cheap Clone, reset(), link_from()",
-        "AppState.cancelled / goal_cancelled switched from Mutex<bool> to CancelToken",
-        "ai::cancel_chat -> state.cancelled.cancel(); run_chat_turn resets via state.cancelled.reset() and checks via is_cancelled()",
-        "controller::cancel_goal -> cancels both goal_cancelled and cancelled so in-flight turn aborts now, not next iteration",
-        "SSE readers in stream_openrouter / stream_ollama wrap stream.next() in tokio::select! vs cancel.cancelled(); on cancel drop reader + return Err(cancelled)",
-        "execute_run_cmd_gated races the confirm-modal oneshot against cancel.cancelled(); evicts pending confirm on cancel",
-        "run_cmd_impl child wait wrapped in select! against cancel; on cancel child.kill() then return Err(cancelled); pipe drains are cancel-aware too",
-        "Unit tests: 6 for CancelToken semantics + 3 for run_cmd mid-flight cancel (sleep 30 killed in <5s), pre-cancelled returns before completion, no-cancel happy path regression guard — 14/14 pass"
-      ]
-    }
+    "optional_follow_ups": [
+      "Parallel task execution (scaffold in max_parallel_tasks)",
+      "Structured planner JSON schema enforced at Ollama side",
+      "Memory compaction when task_history approaches 4 MiB (currently count-capped at 200)",
+      "LSP/code-intelligence integration",
+      "Multi-file diff viewer in Execution pane",
+      "Plugin system for custom tools"
+    ]
   },
   "file_index": [],
   "tool_usage": {
@@ -405,7 +226,9 @@
     "run_cmd": 0
   },
   "notes": [
-    "Rust rewrites this file on every chat turn via memory::save.",
-    "Do not hand-edit during a session; edits will be overwritten."
+    "Rust rewrites this file on every chat turn via memory::save (atomic temp-file + rename + fsync).",
+    "Do not hand-edit during a session; edits will be overwritten.",
+    "schema_version = 2. Older files are migrated by memory::migrate_memory() on read.",
+    "Every goal-driven task carries its own bounded Trace (trace.rs). See trace_schema."
   ]
 }
