@@ -102,6 +102,32 @@
     "turns": [],
     "opened_project": null
   },
+  "delivery_status": {
+    "pr_1": {
+      "url": "https://github.com/salonadel6-sudo/open-claude-code-main/pull/1",
+      "title": "desktop: AI IDE foundation — React SPA + Tauri v2 backend + hybrid AI loop",
+      "state": "open",
+      "ci": "green (no GitHub Actions; Devin Review passed)",
+      "includes": [
+        "React SPA (Vite + React 18 + TS)",
+        "Tauri v2 commands: list_dir, read_file, write_file, watch_dir, run_cmd, send_chat, settings, memory",
+        "Hybrid AI loop (OpenRouter planner + Ollama executor) with graceful fallback",
+        "Persistent PROJECT_MEMORY.json writes from Rust",
+        "PROJECT_PLAN.md + PROJECT_MEMORY.json docs"
+      ]
+    },
+    "blockers": [
+      "Extraction of logic from src/ is paused pending written Anthropic authorization."
+    ],
+    "next_clean_room_phases": [
+      "Streaming tokens (SSE) from OpenRouter + Ollama to ai:token events",
+      "Reviewer agent: plan -> execute -> review -> fix",
+      "Autonomous retry loop with bounded iterations",
+      "Richer memory: file index, decision log",
+      "Inline diff viewer in Execution pane",
+      "run_cmd safety: allow-list + user-confirm dialog"
+    ]
+  },
   "file_index": [],
   "tool_usage": {
     "read_file": 0,

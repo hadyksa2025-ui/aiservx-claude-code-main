@@ -85,22 +85,42 @@ user prompt
 
 ## 3. Implementation Roadmap
 
-| # | Step                                                 | Status      |
-|---|------------------------------------------------------|-------------|
-| 1 | Plan + memory artifacts (this file, memory.json)     | done        |
-| 2 | Vite + React + TypeScript frontend scaffold          | done        |
-| 3 | Three-pane UI shell (Explorer / Chat / Execution)    | done        |
-| 4 | Tauri v2 backend commands: fs + proc + memory        | done        |
-| 5 | Directory watcher with `notify` + event emit         | done        |
-| 6 | AI layer: OpenRouter + Ollama, hybrid router         | done        |
-| 7 | Tool loop (read_file, write_file, list_dir, run_cmd) | done        |
-| 8 | Wire Chat → AI → Tools → FS → UI end to end          | done        |
-| 9 | Persist PROJECT_MEMORY.json from Rust on each turn   | done        |
-|10 | Local build validation: `tsc --noEmit`, `cargo check`| done        |
-|11 | PR creation + description                            | in progress |
-|12 | Follow-up: multi-agent (Planner→Executor→Reviewer)   | not started |
-|13 | Follow-up: session memory / vector memory            | not started |
-|14 | Follow-up: autonomous retry loop + better diffing    | not started |
+| #  | Step                                                 | Status      |
+|----|------------------------------------------------------|-------------|
+|  1 | Plan + memory artifacts (this file, memory.json)     | done        |
+|  2 | Vite + React + TypeScript frontend scaffold          | done        |
+|  3 | Three-pane UI shell (Explorer / Chat / Execution)    | done        |
+|  4 | Tauri v2 backend commands: fs + proc + memory        | done        |
+|  5 | Directory watcher with `notify` + event emit         | done        |
+|  6 | AI layer: OpenRouter + Ollama, hybrid router         | done        |
+|  7 | Tool loop (read_file, write_file, list_dir, run_cmd) | done        |
+|  8 | Wire Chat → AI → Tools → FS → UI end to end          | done        |
+|  9 | Persist PROJECT_MEMORY.json from Rust on each turn   | done        |
+| 10 | Local build validation: `tsc --noEmit`, `cargo check`| done        |
+| 11 | PR #1 open + CI (no GHA; Devin Review passed)        | done        |
+| 12 | Streaming tokens (SSE) from executor/planner to UI   | not started |
+| 13 | Multi-agent: add Reviewer (Plan → Execute → Review)  | not started |
+| 14 | Autonomous retry loop + structured compaction        | not started |
+| 15 | Richer memory: file index, decision log, bounded hist| not started |
+| 16 | UI depth: streaming renderer, inline diff viewer     | not started |
+| 17 | `run_cmd` safety: allow-list + user confirm dialog   | not started |
+
+### 3.1 Blockers
+
+- **Phase that extracts logic from `src/`:** BLOCKED pending written
+  authorization from Anthropic (or a valid open-source release). The
+  user has stated the code is authorized; I am standing by until I can
+  verify written proof. Steps 12–17 above are **clean-room** and do not
+  require `src/` — they can proceed independently.
+
+## 3.5 Current delivery status
+
+- **PR #1** — https://github.com/salonadel6-sudo/open-claude-code-main/pull/1
+  — foundation: React SPA, Tauri v2 backend, hybrid loop, memory, docs.
+  CI green (repo has no GitHub Actions; Devin Review passed).
+- Next PR (proposed, clean-room): streaming (step 12) + Reviewer
+  (step 13) + a smaller improvement batch from steps 15–17.
+- Extraction-from-`src/` PR: **awaiting authorization proof**.
 
 ## 4. Design Decisions
 
