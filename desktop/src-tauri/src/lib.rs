@@ -1,165 +1,81 @@
-use tauri::Manager;
-use serde::{Deserialize, Serialize};
+//! Open Claude Code Desktop — Tauri backend.
+//!
+//! Exposes a small set of commands used by the React frontend:
+//! file system access (`list_dir`, `read_file`, `write_file`), a recursive
+//! directory watcher (`watch_dir`/`unwatch_dir`), a short-lived shell runner
+//! (`run_cmd`), a settings store, and the hybrid AI chat loop (`send_chat`)
+//! that routes between an **OpenRouter** planner and an **Ollama** executor
+//! through an OpenAI-style tool-calling protocol.
+//!
+//! This crate does not depend on the repository's top-level `src/` directory;
+//! `src/` is a read-only research snapshot and is intentionally out of scope.
+
 use std::sync::Mutex;
 
-#[derive(Default)]
-struct AppState {
-    ollama_url: Mutex<String>,
-    model: Mutex<String>,
-    messages: Mutex<Vec<Message>>,
-}
+use tauri::Manager;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Message {
-    role: String,
-    content: String,
-}
+mod ai;
+mod fs_ops;
+mod memory;
+mod settings;
+mod tools;
+mod watcher;
 
-#[derive(Serialize)]
-struct OllamaModel {
-    name: String,
-    size: u64,
-}
+pub(crate) use settings::Settings;
 
-#[tauri::command]
-async fn check_ollama(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let url = state.ollama_url.lock().unwrap().clone();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-    
-    let response = client
-        .get(format!("{}/api/tags", url))
-        .send()
-        .await;
-    
-    match response {
-        Ok(resp) => Ok(resp.status().is_success()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-#[tauri::command]
-async fn get_ollama_models(state: tauri::State<'_, AppState>) -> Result<Vec<OllamaModel>, String> {
-    let url = state.ollama_url.lock().unwrap().clone();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    
-    let response = client
-        .get(format!("{}/api/tags", url))
-        .send()
-        .await
-        .map_err(|e| format!("Connection error: {}", e))?;
-    
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()));
-    }
-    
-    let json: serde_json::Value = response.json().await.map_err(|e| format!("Parse error: {}", e))?;
-    
-    let models: Vec<OllamaModel> = json["models"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|m| OllamaModel {
-            name: m["name"].as_str().unwrap_or("").to_string(),
-            size: m["size"].as_u64().unwrap_or(0),
-        })
-        .collect();
-    
-    Ok(models)
-}
-
-#[tauri::command]
-async fn chat(state: tauri::State<'_, AppState>, message: String) -> Result<String, String> {
-    let url = state.ollama_url.lock().unwrap().clone();
-    let model = state.model.lock().unwrap().clone();
-    
-    // Add user message
-    {
-        let mut messages = state.messages.lock().unwrap();
-        messages.push(Message {
-            role: "user".to_string(),
-            content: message.clone(),
-        });
-    }
-    
-    let messages: Vec<Message> = state.messages.lock().unwrap().clone();
-    
-    let client = reqwest::Client::new();
-    let request_body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": false
-    });
-    
-    let response = client
-        .post(format!("{}/api/chat", url))
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    
-    if !response.status().is_success() {
-        let error = response.text().await.unwrap_or_default();
-        return Err(format!("Ollama error: {}", error));
-    }
-    
-    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    let assistant_message = json["message"]["content"].as_str().unwrap_or("").to_string();
-    
-    // Add assistant message to history
-    {
-        let mut messages = state.messages.lock().unwrap();
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: assistant_message.clone(),
-        });
-    }
-    
-    Ok(assistant_message)
-}
-
-#[tauri::command]
-fn set_ollama_url(state: tauri::State<'_, AppState>, url: String) {
-    *state.ollama_url.lock().unwrap() = url;
-}
-
-#[tauri::command]
-fn set_model(state: tauri::State<'_, AppState>, model: String) {
-    *state.model.lock().unwrap() = model;
-    // Clear messages when model changes
-    state.messages.lock().unwrap().clear();
-}
-
-#[tauri::command]
-fn clear_chat(state: tauri::State<'_, AppState>) {
-    state.messages.lock().unwrap().clear();
+/// Shared, mutable application state, owned by Tauri.
+pub struct AppState {
+    /// Active settings (loaded from / persisted to the app config dir).
+    pub settings: Mutex<Settings>,
+    /// Running directory watchers, keyed by project root.
+    pub watchers: watcher::Watchers,
+    /// Cancellation flag shared by in-flight chat loops.
+    pub cancelled: Mutex<bool>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("open_claude_code_desktop=info,info")),
+        )
+        .try_init();
+
+    info!("Starting Open Claude Code Desktop");
+
+    let initial_settings = Settings::load().unwrap_or_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            ollama_url: Mutex::new("http://localhost:11434".to_string()),
-            model: Mutex::new("llama3.2:1b".to_string()),
-            messages: Mutex::new(vec![]),
+            settings: Mutex::new(initial_settings),
+            watchers: watcher::Watchers::default(),
+            cancelled: Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
-            check_ollama,
-            get_ollama_models,
-            chat,
-            set_ollama_url,
-            set_model,
-            clear_chat
+            fs_ops::list_dir,
+            fs_ops::read_file,
+            fs_ops::write_file,
+            watcher::watch_dir,
+            watcher::unwatch_dir,
+            tools::run_cmd,
+            ai::send_chat,
+            ai::cancel_chat,
+            ai::check_planner,
+            ai::check_executor,
+            settings::get_settings,
+            settings::save_settings,
+            memory::load_memory,
+            memory::save_memory,
         ])
         .setup(|app| {
-            let window = app.get_webview_window("main").unwrap();
-            window.set_title("Open Claude Code - Ollama").ok();
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_title("Open Claude Code");
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

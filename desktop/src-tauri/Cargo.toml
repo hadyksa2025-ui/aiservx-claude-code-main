@@ -1,9 +1,18 @@
 [package]
 name = "open-claude-code-desktop"
 version = "0.1.0"
-description = "Open Claude Code Desktop - Desktop GUI wrapper"
+description = "Open Claude Code Desktop - small AI IDE (hybrid OpenRouter + Ollama)"
 authors = ["Open Claude Code"]
 edition = "2021"
+
+[lib]
+name = "open_claude_code_desktop"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "open-claude-code-desktop"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
@@ -11,13 +20,24 @@ tauri-build = { version = "2.0", features = [] }
 [dependencies]
 tauri = { version = "2.0", features = ["devtools"] }
 tauri-plugin-shell = "2.0"
+tauri-plugin-dialog = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 num_cpus = "1.16"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+notify = "6.1"
+notify-debouncer-full = "0.3"
+walkdir = "2.5"
+similar = "2.6"
+dirs = "5.0"
+uuid = { version = "1.10", features = ["v4"] }
+anyhow = "1.0"
+thiserror = "1.0"
 
 [features]
 default = ["custom-protocol"]

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.opencode.code",
   "build": {
-    "beforeBuildCommand": "",
-    "beforeDevCommand": "",
-    "devUrl": null,
+    "beforeBuildCommand": "cd ../frontend && npm install && npm run build",
+    "beforeDevCommand": "cd ../frontend && npm install && npm run dev",
+    "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },
   "app": {
@@ -14,12 +14,12 @@
     "windows": [
       {
         "title": "Open Claude Code",
-        "width": 1200,
-        "height": 800,
+        "width": 1280,
+        "height": 820,
         "resizable": true,
         "fullscreen": false,
-        "minWidth": 800,
-        "minHeight": 600
+        "minWidth": 960,
+        "minHeight": 640
       }
     ],
     "security": {
