@@ -2403,8 +2403,10 @@ name = "open-claude-code-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "dirs 5.0.1",
  "futures-util",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "num_cpus",

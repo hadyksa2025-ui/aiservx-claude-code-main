@@ -346,7 +346,7 @@ async fn stream_openrouter(
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     if cancel.is_cancelled() {
-        return Err("cancelled".into());
+        return Err(cancel.err_string());
     }
     if settings.openrouter_api_key.is_empty() {
         return Err("no OpenRouter API key".into());
@@ -392,7 +392,7 @@ async fn stream_openrouter(
             biased;
             _ = cancel.cancelled() => {
                 drop(stream);
-                return Err("cancelled".into());
+                return Err(cancel.err_string());
             }
             c = stream.next() => c,
         };
@@ -458,7 +458,7 @@ async fn stream_ollama(
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     if cancel.is_cancelled() {
-        return Err("cancelled".into());
+        return Err(cancel.err_string());
     }
     let url = format!("{}/api/chat", settings.ollama_base_url.trim_end_matches('/'));
     let mut body = json!({
@@ -493,7 +493,7 @@ async fn stream_ollama(
             biased;
             _ = cancel.cancelled() => {
                 drop(stream);
-                return Err("cancelled".into());
+                return Err(cancel.err_string());
             }
             c = stream.next() => c,
         };
@@ -965,4 +965,147 @@ fn finish_step(
 #[allow(dead_code)]
 fn _keep_duration_in_scope() -> Duration {
     Duration::from_secs(0)
+}
+
+#[cfg(test)]
+mod sse_cancel_tests {
+    //! Prove the cancel-vs-stream race pattern used by
+    //! `stream_openrouter` and `stream_ollama` actually unwinds
+    //! mid-stream, not just between frames. Both providers use the
+    //! exact same `tokio::select! { biased; _ = cancel.cancelled() =>
+    //! return Err(cancel.err_string()); c = stream.next() => c }`
+    //! pattern; we exercise it here against two shapes of stream that
+    //! are hard to mock through `reqwest::Response::bytes_stream()` —
+    //! an idle stream (no chunks arriving) and a loaded stream (chunks
+    //! arriving every 10ms indefinitely).
+    use super::*;
+    use crate::cancel::{CancelReason, CancelToken};
+    use bytes::Bytes;
+    use futures_util::stream;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+    use tokio::time::sleep;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    // The exact loop body used by stream_openrouter / stream_ollama,
+    // distilled to just the cancel + next-chunk race. We only need to
+    // prove the two exits (cancel wins vs chunk wins) work.
+    async fn drive_stream_until_cancel<S>(
+        mut stream: S,
+        cancel: &CancelToken,
+    ) -> Result<usize, String>
+    where
+        S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+    {
+        let mut chunks_seen: usize = 0;
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Drop stream (equivalent to dropping the reqwest
+                    // response: the underlying TCP connection is closed
+                    // and we stop reading).
+                    drop(stream);
+                    return Err(cancel.err_string());
+                }
+                c = stream.next() => c,
+            };
+            match chunk {
+                Some(Ok(_)) => chunks_seen += 1,
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Ok(chunks_seen), // natural end of stream
+            }
+        }
+    }
+
+    // An idle SSE-like stream: TCP is up, headers were read, but the
+    // server hasn't sent a single frame yet. Without the select! race
+    // we would block on `stream.next()` forever.
+    #[tokio::test]
+    async fn sse_cancel_unblocks_idle_stream() {
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            t2.cancel_with(CancelReason::User);
+        });
+        let start = Instant::now();
+        // `stream::pending()` never yields — if select! didn't observe
+        // cancel, this would hang.
+        let pending = stream::pending::<Result<Bytes, std::io::Error>>();
+        let res = drive_stream_until_cancel(pending, &token).await;
+        let elapsed = start.elapsed();
+        assert_eq!(res, Err("cancelled: user".to_string()));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel should unblock an idle stream fast, took {:?}",
+            elapsed
+        );
+    }
+
+    // A loaded SSE-like stream: chunks arriving every 10ms forever.
+    // The loop keeps consuming them; cancel still has to interrupt
+    // mid-stream. This is the "under load" case the reviewer called
+    // out.
+    #[tokio::test]
+    async fn sse_cancel_unblocks_loaded_stream_mid_flight() {
+        let token = CancelToken::new();
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+
+        // Producer: spam chunks forever.
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            loop {
+                if producer_tx
+                    .send(Ok(Bytes::from_static(b"data: {}\n\n")))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+        drop(tx);
+
+        // Canceller: trip the token after ~100ms, long after the
+        // consumer has seen chunks flowing.
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            t2.cancel_with(CancelReason::Goal);
+        });
+
+        let stream = ReceiverStream::new(rx);
+        let start = Instant::now();
+        let res = drive_stream_until_cancel(stream, &token).await;
+        let elapsed = start.elapsed();
+        producer.abort();
+
+        assert_eq!(res, Err("cancelled: goal".to_string()));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel should unwind a loaded stream fast, took {:?}",
+            elapsed
+        );
+    }
+
+    // A pre-cancelled token should short-circuit on the very first
+    // select! poll, before reading any chunk.
+    #[tokio::test]
+    async fn sse_cancel_pre_cancelled_token_returns_before_first_chunk() {
+        let token = CancelToken::new();
+        token.cancel_with(CancelReason::CircuitOpen);
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        // Pre-fill one chunk so the stream is immediately readable.
+        tx.send(Ok(Bytes::from_static(b"data: {}\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        let stream = ReceiverStream::new(rx);
+        let res = drive_stream_until_cancel(stream, &token).await;
+        // biased select! picks the cancel branch first even though the
+        // stream would also be ready.
+        assert_eq!(res, Err("cancelled: circuit_open".to_string()));
+    }
 }

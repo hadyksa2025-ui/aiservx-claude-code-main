@@ -177,6 +177,14 @@ pub async fn start_goal(
         match timeout(Duration::from_secs(goal_timeout_secs), inner).await {
             Ok(pair) => pair,
             Err(_) => {
+                // Trip both tokens so anything still in flight — a
+                // streaming SSE request, a long-running `run_cmd`
+                // child, a confirm-modal race — sees `Timeout` as the
+                // cancel reason and tears down now, instead of leaking
+                // past the goal timeout.
+                use crate::cancel::CancelReason;
+                state.goal_cancelled.cancel_with(CancelReason::Timeout);
+                state.cancelled.cancel_with(CancelReason::Timeout);
                 tree.status = "timeout".into();
                 mark_unfinished(&app, &project_dir, &mut tree, "goal timeout");
                 let c = tree.tasks.iter().filter(|t| t.status == TaskStatus::Done.as_str()).count();
@@ -208,12 +216,14 @@ pub async fn start_goal(
 #[tauri::command]
 pub fn cancel_goal(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Trip both the goal token (observed between tasks) and the chat
-    // token (observed inside the in-flight turn). `cancel()` notifies
-    // every `cancelled()` awaiter so the SSE stream, the child process
-    // wait in `run_cmd`, and the confirm-modal race all unwind now
-    // instead of waiting for the next iteration boundary.
-    state.goal_cancelled.cancel();
-    state.cancelled.cancel();
+    // token (observed inside the in-flight turn) with `CancelReason::Goal`
+    // so downstream error strings / events distinguish goal-level cancel
+    // from a user pressing Cancel in the chat panel. Every `cancelled()`
+    // awaiter (SSE stream, `run_cmd` child wait, confirm-modal race)
+    // unwinds now instead of waiting for the next iteration boundary.
+    use crate::cancel::CancelReason;
+    state.goal_cancelled.cancel_with(CancelReason::Goal);
+    state.cancelled.cancel_with(CancelReason::Goal);
     Ok(())
 }
 

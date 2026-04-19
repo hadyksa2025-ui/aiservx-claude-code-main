@@ -39,6 +39,19 @@ uuid = { version = "1.10", features = ["v4"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
+# Subprocess-tree kill: on Unix we call `killpg(-pgid, SIGKILL)` through
+# libc. On Windows we shell out to `taskkill /T /F /PID <pid>`, so no
+# extra crate is needed there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# `bytes` is already pulled transitively by reqwest; declared here so
+# the ai::sse_cancel_tests module can import it directly. `tokio-stream`
+# is in the main deps and already exposes `wrappers::ReceiverStream`
+# via the `sync` feature (enabled by default).
+bytes = "1"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
