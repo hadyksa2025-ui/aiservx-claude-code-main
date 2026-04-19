@@ -659,7 +659,21 @@ pub async fn probe_ollama(
         })
         .unwrap_or_default();
     let model_available = match model.as_deref() {
-        Some(want) if !want.is_empty() => names.iter().any(|n| n == want),
+        Some(want) if !want.is_empty() => {
+            // Ollama's /api/tags always returns names with an explicit tag
+            // (e.g. `qwen2.5:latest`), but users typically enter the bare
+            // name (`qwen2.5`) — and /api/chat itself resolves the implicit
+            // `:latest` tag. Normalise both forms so we don't falsely warn
+            // "model not pulled" when the model works.
+            let want_normalised = if want.contains(':') {
+                want.to_string()
+            } else {
+                format!("{}:latest", want)
+            };
+            names
+                .iter()
+                .any(|n| n == want || n == &want_normalised)
+        }
         _ => true,
     };
     Ok(OllamaProbeResult {
