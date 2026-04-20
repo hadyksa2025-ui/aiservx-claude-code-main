@@ -1529,8 +1529,15 @@ pub(crate) async fn run_chat_turn(
                 //
                 // We only fire on `iteration == 0` so later iterations
                 // (executor genuinely signing off after several tool
-                // calls) don't trigger a false positive.
-                if iteration == 0 {
+                // calls) don't trigger a false positive. We also skip
+                // json_mode turns entirely — `plan_goal` runs the
+                // executor without a tool schema on purpose (see
+                // line ~1489: `if json_mode { None } else { Some(&schema) }`),
+                // so "zero tool calls on iteration 0" is the expected
+                // correct behaviour there, not a capability failure.
+                // Without this guard every goal would fire a spurious
+                // warning (PR #12 Devin Review).
+                if iteration == 0 && !json_mode {
                     let _ = app.emit(
                         "ai:executor_unparsed",
                         json!({

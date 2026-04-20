@@ -188,8 +188,14 @@ export function Chat({ projectDir, disabled }: Props) {
     unlistens.push(
       onEvent<ExecutorUnparsedEvent>("ai:executor_unparsed", (p) => {
         setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last && last.kind === "warn_action" && last.role === "system") {
+          // The backend fires this event at two failure points in a
+          // single turn (executor iteration-0 with zero tool_calls,
+          // and reviewer Unknown verdict). A reviewer token bubble
+          // can stream in between those two emissions, so we cannot
+          // dedup by looking at just the last message — we have to
+          // scan the whole list for an existing warn_action pill
+          // (PR #12 Devin Review).
+          if (prev.some((m) => m.kind === "warn_action" && m.role === "system")) {
             return prev;
           }
           const modelNote = p.model ? ` (executor: \`${p.model}\`)` : "";
