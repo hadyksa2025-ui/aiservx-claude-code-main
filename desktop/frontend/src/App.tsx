@@ -1,10 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, onEvent } from "./api";
 import type {
   AgentRole,
-  ChatMessage,
-  ExecutionEvent,
   FsChange,
   StepEvent,
   ToolCall,
@@ -16,44 +14,32 @@ import { Execution } from "./components/Execution";
 import { SettingsModal } from "./components/Settings";
 import { ConfirmCmdOverlay } from "./components/ConfirmCmd";
 import { TaskPanel } from "./components/TaskPanel";
-
-/**
- * Maximum number of entries the in-memory execution-event ring buffer
- * keeps. Once reached, the oldest entries are dropped so long
- * autonomous runs can't OOM the renderer. Audit §7.7 / addendum §2.
- */
-const EVENTS_CAP = 500;
+import { EVENTS_CAP, useAppStore } from "./store";
 
 export default function App() {
-  const [projectDir, setProjectDir] = useState<string | null>(null);
-  const [plannerOk, setPlannerOk] = useState<boolean | null>(null);
-  const [executorOk, setExecutorOk] = useState<boolean | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [events, setEvents] = useState<ExecutionEvent[]>([]);
-  const [fsTick, setFsTick] = useState(0);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  // The execution pane is a developer-facing debug view. Collapsed by
-  // default so a fresh install doesn't greet the user with a raw
-  // event stream; pops back open automatically on the first error so
-  // failures are never silently hidden.
-  const [debugOpen, setDebugOpen] = useState(false);
-  const [explorerOpen, setExplorerOpen] = useState(true);
-
-  /**
-   * Append an entry to the execution-event log and trim the tail so the
-   * buffer can never balloon past {@link EVENTS_CAP} entries. Without
-   * this cap a long autonomous run emits a step every few seconds plus
-   * every tool call/result, and the `Execution` list grew unbounded —
-   * audit §7.7 / addendum §2 flagged this as a production risk
-   * (memory churn + scroll jank). Keeping only the tail is safe
-   * because the UI already shows newest-first with a "clear" button.
-   */
-  const pushEvent = useCallback((e: ExecutionEvent) => {
-    setEvents((prev) => {
-      const next = prev.length >= EVENTS_CAP ? prev.slice(-(EVENTS_CAP - 1)) : prev;
-      return [...next, e];
-    });
-  }, []);
+  // Consume store slices by selector so components that only care
+  // about (say) health-probe state don't re-render when the event log
+  // changes. Audit §7.6.
+  const projectDir = useAppStore((s) => s.projectDir);
+  const setProjectDir = useAppStore((s) => s.setProjectDir);
+  const fsTick = useAppStore((s) => s.fsTick);
+  const bumpFsTick = useAppStore((s) => s.bumpFsTick);
+  const plannerOk = useAppStore((s) => s.plannerOk);
+  const setPlannerOk = useAppStore((s) => s.setPlannerOk);
+  const executorOk = useAppStore((s) => s.executorOk);
+  const setExecutorOk = useAppStore((s) => s.setExecutorOk);
+  const events = useAppStore((s) => s.events);
+  const pushEvent = useAppStore((s) => s.pushEvent);
+  const pushError = useAppStore((s) => s.pushError);
+  const replaceEvents = useAppStore((s) => s.replaceEvents);
+  const clearEvents = useAppStore((s) => s.clearEvents);
+  const resetMessages = useAppStore((s) => s.resetMessages);
+  const debugOpen = useAppStore((s) => s.debugOpen);
+  const toggleDebug = useAppStore((s) => s.toggleDebug);
+  const explorerOpen = useAppStore((s) => s.explorerOpen);
+  const toggleExplorer = useAppStore((s) => s.toggleExplorer);
+  const settingsOpen = useAppStore((s) => s.settingsOpen);
+  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
 
   // Health check on mount and when settings close
   const refreshHealth = useCallback(async () => {
@@ -67,7 +53,7 @@ export default function App() {
     } catch {
       setExecutorOk(false);
     }
-  }, []);
+  }, [setPlannerOk, setExecutorOk]);
 
   useEffect(() => {
     void refreshHealth();
@@ -92,30 +78,17 @@ export default function App() {
       ),
     );
     unlistens.push(
-      onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) => {
-        pushEvent({
-          kind: "error",
-          text: p.message,
-          role: p.role,
-          at: Date.now(),
-        });
-        // Surface the debug panel the moment anything goes wrong — a
-        // silent collapsed panel on a failed run is exactly the kind
-        // of UX the audit flagged.
-        setDebugOpen(true);
-      }),
+      onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) =>
+        pushError(p.message, p.role),
+      ),
     );
-    unlistens.push(
-      onEvent<FsChange>("fs:changed", () => setFsTick((t) => t + 1)),
-    );
+    unlistens.push(onEvent<FsChange>("fs:changed", () => bumpFsTick()));
     return () => {
       for (const p of unlistens) {
         void p.then((fn) => fn());
       }
     };
-    // `pushEvent` is stable — it's a useCallback with no deps.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [pushEvent, pushError, bumpFsTick]);
 
   // Watcher lifecycle tied to the opened project.
   useEffect(() => {
@@ -125,11 +98,7 @@ export default function App() {
       try {
         await api.watchDir(projectDir);
       } catch (e) {
-        pushEvent({
-          kind: "error",
-          text: `Failed to start watcher: ${String(e)}`,
-          at: Date.now(),
-        });
+        pushError(`Failed to start watcher: ${String(e)}`);
       }
     })();
     return () => {
@@ -137,7 +106,7 @@ export default function App() {
       cancelled = true;
       void api.unwatchDir(projectDir).catch(() => {});
     };
-  }, [projectDir]);
+  }, [projectDir, pushError]);
 
   const openProject = useCallback(async () => {
     const selected = await openDialog({
@@ -147,8 +116,8 @@ export default function App() {
     });
     if (typeof selected === "string" && selected.length > 0) {
       setProjectDir(selected);
-      setMessages([]);
-      setEvents([
+      resetMessages();
+      replaceEvents([
         {
           kind: "info",
           text: `Opened project: ${selected}`,
@@ -156,7 +125,7 @@ export default function App() {
         },
       ]);
     }
-  }, []);
+  }, [setProjectDir, resetMessages, replaceEvents]);
 
   const statusPlanner = useMemo(() => {
     if (plannerOk === null) return "checking…";
@@ -167,6 +136,8 @@ export default function App() {
     if (executorOk === null) return "checking…";
     return executorOk ? "ollama online" : "ollama offline";
   }, [executorOk]);
+
+  const chatDisabled = !projectDir || executorOk === false;
 
   return (
     <div className="app">
@@ -226,7 +197,7 @@ export default function App() {
           <div className="pane-header">
             <button
               className="pane-toggle"
-              onClick={() => setExplorerOpen((v) => !v)}
+              onClick={toggleExplorer}
               aria-expanded={explorerOpen}
               aria-label={
                 explorerOpen ? "collapse explorer" : "expand explorer"
@@ -259,22 +230,14 @@ export default function App() {
         <section className="pane" aria-label="Goal and tasks">
           <div className="pane-header">Goal &amp; Tasks</div>
           <div className="pane-body">
-            <TaskPanel
-              projectDir={projectDir}
-              disabled={!projectDir || executorOk === false}
-            />
+            <TaskPanel projectDir={projectDir} disabled={chatDisabled} />
           </div>
         </section>
 
         <section className="pane" aria-label="Chat">
           <div className="pane-header">Chat</div>
           <div className="pane-body chat">
-            <Chat
-              projectDir={projectDir}
-              messages={messages}
-              setMessages={setMessages}
-              disabled={!projectDir || executorOk === false}
-            />
+            <Chat projectDir={projectDir} disabled={chatDisabled} />
           </div>
         </section>
 
@@ -285,7 +248,7 @@ export default function App() {
           <div className="pane-header">
             <button
               className="pane-toggle"
-              onClick={() => setDebugOpen((v) => !v)}
+              onClick={toggleDebug}
               aria-expanded={debugOpen}
               aria-label={debugOpen ? "collapse debug panel" : "expand debug panel"}
               title={debugOpen ? "Collapse" : "Expand"}
@@ -310,7 +273,7 @@ export default function App() {
             <div style={{ flex: 1 }} />
             {debugOpen && (
               <button
-                onClick={() => setEvents([])}
+                onClick={clearEvents}
                 style={{ fontSize: 10, padding: "2px 6px" }}
               >
                 clear

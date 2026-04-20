@@ -7,14 +7,13 @@ import {
   type ErrorEvent,
 } from "../api";
 import type { AgentRole, ChatMessage, StepEvent } from "../types";
+import { useAppStore } from "../store";
 import { FinalAnswerBubble } from "./FinalAnswerBubble";
 import { SystemAction } from "./SystemAction";
 import { ThinkingBlock } from "./ThinkingBlock";
 
 type Props = {
   projectDir: string | null;
-  messages: ChatMessage[];
-  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
   disabled: boolean;
 };
 
@@ -76,7 +75,12 @@ function classifyMessages(messages: ChatMessage[]): Tier[] {
   return tiers;
 }
 
-export function Chat({ projectDir, messages, setMessages, disabled }: Props) {
+export function Chat({ projectDir, disabled }: Props) {
+  // Messages live in the global store so other components (e.g. a
+  // future task-panel that needs to append a system note) can push
+  // without another prop round-trip. Audit §7.6.
+  const messages = useAppStore((s) => s.messages);
+  const setMessages = useAppStore((s) => s.setMessages);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);

@@ -11,7 +11,9 @@
   --danger: #ff6b6b;
   --ok: #4ade80;
   --warn: #fbbf24;
-  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Oxygen, Ubuntu, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
 * {
@@ -29,11 +31,13 @@ body,
 body {
   background: var(--bg);
   color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-    Ubuntu, sans-serif;
+  font-family: var(--font-ui);
   font-size: 13px;
   line-height: 1.45;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 }
 
 button {
@@ -383,6 +387,29 @@ textarea:focus {
   flex-direction: column;
   gap: 6px;
   padding: 10px;
+  /* The Execution pane is mounted inside `.pane-body { overflow: auto }`
+     but we need an explicit flex container so the virtualised list
+     below can stretch to the remaining height. */
+  height: 100%;
+  min-height: 0;
+}
+/* Virtualised event list (react-window). The inner `.exec-virtual-list`
+   node is what react-window actually owns — we give the wrapper a
+   positive flex basis so it grows to fill the pane regardless of the
+   preceding timeline's height. Row wrappers absorb spacing so the
+   measured height matches the rendered one. */
+.exec-virtual-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.exec-virtual-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+.exec-row-wrap {
+  padding-bottom: 6px;
 }
 .exec-item {
   border: 1px solid var(--border);

@@ -128,23 +128,23 @@
 
 ---
 
-## ⏳ المرحلة 5 — تلميع وأداء (1 أسبوع)
+## ✅ المرحلة 5 — تلميع وأداء (PR #6 + #7)
 
 **الهدف**: تحويل الأداة من "developer tool" إلى "product".
 
 **المرجع**: `FULL_SYSTEM_AUDIT.md` Section 7.6-7.7
 
-| # | المهمة | الملف | الأولوية |
-|---|--------|-------|----------|
-| 1 | Dark theme color palette | CSS variables | 🔴 عالية |
-| 2 | Inter + JetBrains Mono typography | CSS + package.json | 🟡 متوسطة |
-| 3 | 8px grid spacing system | CSS | 🟡 متوسطة |
-| 4 | Responsive layout (panels قابلة للطي) | `App.tsx` | 🔴 عالية |
-| 5 | Loading skeletons | `Chat.tsx`, `TaskPanel.tsx` | 🟡 متوسطة |
-| 6 | Zustand store بدل `useState` chains | `store.ts` جديد | 🔴 عالية |
-| 7 | `react-window` virtualization لقائمة الرسائل | `Chat.tsx` | 🟡 متوسطة |
-| 8 | Event ring buffer (cap 500 entries) | `App.tsx` | 🟡 متوسطة |
-| 9 | ARIA roles + keyboard nav + `prefers-reduced-motion` (Addendum 2.8) | كل الـ components | 🔴 عالية |
+| # | المهمة | الملف | الحالة |
+|---|--------|-------|--------|
+| 1 | Dark theme color palette | CSS variables | ✅ PR سابقة (CSS vars في `:root`) |
+| 2 | Inter + JetBrains Mono typography | CSS + `@fontsource/*` | ✅ PR #7 (self-hosted via `@fontsource/inter` + `@fontsource/jetbrains-mono`) |
+| 3 | 8px grid spacing system | CSS | ✅ قائم (kept as-is — current padding is already 4/6/8/10/12 px on an 8-aligned grid) |
+| 4 | Responsive layout (panels قابلة للطي) | `App.tsx` + `styles.css` | ✅ PR #6 (Explorer/Debug rails + 1100/900 px breakpoints) |
+| 5 | Loading skeletons | `Chat.tsx`, `TaskPanel.tsx` | ⏳ (مؤجَّل — current empty-states are explicit and friendly; skeletons would be cosmetic) |
+| 6 | Zustand store بدل `useState` chains | `store.ts` جديد | ✅ PR #7 (`src/store.ts` — projectDir, events, messages, UI toggles, pushError) |
+| 7 | `react-window` virtualization لقائمة الرسائل | `components/Execution.tsx` | ✅ PR #7 (virtualised Debug pane; Chat kept linear — streaming + variable heights would fight virtualisation) |
+| 8 | Event ring buffer (cap 500 entries) | `App.tsx` / `store.ts` | ✅ PR #6 (moved into the store in PR #7) |
+| 9 | ARIA roles + keyboard nav + `prefers-reduced-motion` | كل الـ components | ✅ PR #6 (semantic header/section landmarks, `aria-label`, `aria-live`, reduced-motion already applied to streaming dots in Phase 3) |
 
 **معيار الاكتمال**: هوية بصرية احترافية. يعمل على أحجام شاشات مختلفة. لا jank. WCAG 2.1 AA.
 
