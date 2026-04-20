@@ -106,23 +106,25 @@
 
 ---
 
-## ⏳ المرحلة 4 — إعادة تصميم Task Panel (1 أسبوع)
+## ✅ المرحلة 4 — إعادة تصميم Task Panel (مُكتملة)
 
 **الهدف**: جعل الوضع التلقائي (autonomous mode) موثوقاً بصرياً.
 
 **المرجع**: `FULL_SYSTEM_AUDIT.md` Section 7.4
 
-| # | المهمة | الملف | الأولوية |
-|---|--------|-------|----------|
-| 1 | أيقونات حالة (✓/✗/⋯/○/⊘) بدل نص | `TaskPanel.tsx` | 🔴 عالية |
-| 2 | توقيت لكل task (مدة للمكتمل / "running..." للجاري) | `TaskPanel.tsx` | 🔴 عالية |
-| 3 | شريط تقدم بنسبة مئوية + عداد (2/5 tasks) | `TaskPanel.tsx` | 🔴 عالية |
-| 4 | Tool calls مباشرة على الـ task الجاري | `TaskPanel.tsx` | 🟡 متوسطة |
-| 5 | Execution pane → Debug panel قابل للطي | `App.tsx` | 🟡 متوسطة |
-| 6 | ملخصات فشل مختصرة (بدل JSON خام) | `TaskPanel.tsx` | 🟡 متوسطة |
-| 7 | إظهار `executor_iterations` counter (Addendum 2.9) | `ChatResponse` + UI | 🟢 منخفضة |
+| # | المهمة | الملف | الحالة |
+|---|--------|-------|--------|
+| 1 | أيقونات حالة (✓/✗/⋯/○/⊘) بدل نص | `TaskPanel.tsx` | ✅ `.task-icon` + `statusIcon()` + goal-level icon في status chip |
+| 2 | توقيت لكل task + goal (مدة/elapsed live) | `TaskPanel.tsx` | ✅ `nowSec` tick + `formatDurationSec()` + `.task-duration` + `.task-goal-duration` |
+| 3 | شريط تقدم بنسبة مئوية + عداد + running/failed counts | `TaskPanel.tsx` | ✅ `progressbar` ARIA + `.task-progress-running` / `.task-progress-failed` chips |
+| 4 | Tool calls مباشرة على الـ task الجاري | `TaskPanel.tsx` | ✅ `pickLiveAction()` + `.task-live-action` (newest tool_call / first error) |
+| 5 | Execution pane → Debug panel قابل للطي | `App.tsx` | ✅ `debugOpen` + auto-expand على `ai:error` + `panes-debug-collapsed` grid |
+| 6 | ملخصات فشل مختصرة (بدل JSON خام) | `TaskPanel.tsx` | ✅ `condenseResult()` + `shortTaskId()` + `title` لعرض النص الكامل |
+| 7 | إظهار `executor_iterations` counter (Addendum 2.9) | `ChatResponse` + UI | ✅ حقل `executor_iterations` على `ChatResponse` في `ai.rs` + typed على `api.ts` |
 
-**معيار الاكتمال**: بنظرة واحدة: كم task اكتمل، أيهم يعمل، كم بقي، وكم استغرق.
+**معيار الاكتمال**: بنظرة واحدة: كم task اكتمل، أيهم يعمل، كم بقي، وكم استغرق. ✅
+
+**PR**: `feat(desktop): Phase 4 — Task Panel redesign + collapsible Debug pane`
 
 ---
 

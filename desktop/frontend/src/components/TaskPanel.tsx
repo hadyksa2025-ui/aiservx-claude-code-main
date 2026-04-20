@@ -228,16 +228,44 @@ export function TaskPanel({ projectDir, disabled }: Props) {
   }, []);
 
   const progress = useMemo(() => {
-    if (!tree || tree.tasks.length === 0) return { done: 0, total: 0, pct: 0 };
-    const done = tree.tasks.filter(
-      (t) => t.status === "done" || t.status === "failed" || t.status === "skipped",
-    ).length;
+    if (!tree || tree.tasks.length === 0)
+      return { done: 0, total: 0, pct: 0, succeeded: 0, failed: 0, running: 0 };
+    const succeeded = tree.tasks.filter((t) => t.status === "done").length;
+    const failed = tree.tasks.filter((t) => t.status === "failed").length;
+    const skipped = tree.tasks.filter((t) => t.status === "skipped").length;
+    const running = tree.tasks.filter((t) => t.status === "running").length;
+    const done = succeeded + failed + skipped;
     return {
       done,
       total: tree.tasks.length,
       pct: Math.round((done / tree.tasks.length) * 100),
+      succeeded,
+      failed,
+      running,
     };
   }, [tree]);
+
+  // 1s clock for the live elapsed-time display on any running task /
+  // the overall goal duration. Only ticks while the run is active so
+  // idle projects don't re-render the tree every second.
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    if (runState !== "running") return;
+    const id = setInterval(
+      () => setNowSec(Math.floor(Date.now() / 1000)),
+      1000,
+    );
+    return () => clearInterval(id);
+  }, [runState]);
+
+  const goalDurationSec = useMemo(() => {
+    if (!tree) return null;
+    const ref =
+      runState === "running"
+        ? nowSec
+        : Math.max(tree.updated_at, tree.created_at);
+    return Math.max(0, ref - tree.created_at);
+  }, [tree, nowSec, runState]);
 
   return (
     <div className="task-panel">
@@ -283,13 +311,46 @@ export function TaskPanel({ projectDir, disabled }: Props) {
       {tree && (
         <div className="task-tree">
           <div className="task-tree-header">
-            <span className={`task-status-chip task-status-${runState}`}>
+            <span
+              className={`task-status-chip task-status-${runState}`}
+              aria-label={`goal ${runState}`}
+            >
+              <span className={`task-icon task-icon-goal-${runState}`} aria-hidden>
+                {runStateIcon(runState)}
+              </span>
               {runState}
             </span>
             <span className="task-progress">
               {progress.done}/{progress.total} · {progress.pct}%
             </span>
-            <div className="task-progress-bar">
+            {progress.running > 0 && (
+              <span className="task-progress-running" title="tasks currently running">
+                {progress.running} running
+              </span>
+            )}
+            {progress.failed > 0 && (
+              <span className="task-progress-failed" title="tasks that failed">
+                {progress.failed} failed
+              </span>
+            )}
+            {goalDurationSec != null && (
+              <span
+                className="task-goal-duration"
+                aria-label={`goal ${
+                  runState === "running" ? "elapsed" : "duration"
+                }`}
+              >
+                {formatDurationSec(goalDurationSec)}
+              </span>
+            )}
+            <div
+              className="task-progress-bar"
+              role="progressbar"
+              aria-valuenow={progress.pct}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label="goal progress"
+            >
               <div
                 className="task-progress-fill"
                 style={{ width: `${progress.pct}%` }}
@@ -300,7 +361,13 @@ export function TaskPanel({ projectDir, disabled }: Props) {
           {summary && <div className="task-summary">{summary}</div>}
           <ol className="task-list">
             {tree.tasks.map((t, i) => (
-              <TaskRow key={t.id} index={i + 1} task={t} trace={t.trace} />
+              <TaskRow
+                key={t.id}
+                index={i + 1}
+                task={t}
+                trace={t.trace}
+                nowSec={nowSec}
+              />
             ))}
             {tree.tasks.length === 0 && (
               <li className="task-empty">
@@ -322,8 +389,15 @@ export function TaskPanel({ projectDir, disabled }: Props) {
                 <span className="task-failure-time">
                   {new Date(f.at * 1000).toLocaleTimeString()}
                 </span>
-                <span className="task-failure-id">{f.task_id}</span>
-                <span className="task-failure-msg">{f.error}</span>
+                <span className="task-failure-id" title={f.task_id}>
+                  {shortTaskId(f.task_id)}
+                </span>
+                <span
+                  className="task-failure-msg"
+                  title={f.error.length > 200 ? f.error : undefined}
+                >
+                  {condenseResult(f.error)}
+                </span>
               </li>
             ))}
           </ul>
@@ -344,23 +418,69 @@ function TaskRow({
   index,
   task,
   trace,
+  nowSec,
 }: {
   index: number;
   task: Task;
   trace?: TaskTrace;
+  /** Current clock (epoch seconds) — used to compute elapsed time for
+   *  running tasks. Passed in from the parent so every row ticks off
+   *  the same timer. */
+  nowSec: number;
 }) {
   const [open, setOpen] = useState(false);
   const hasTrace = !!trace && trace.entries.length > 0;
+
+  // Pick the freshest "thing happening right now" to surface on the
+  // row header so the user doesn't have to open the trace just to see
+  // that a long-running tool call is still alive. For completed tasks
+  // this shows the reason the task failed (if any) so the 200-entry
+  // trace isn't the first place the user has to look.
+  const liveAction = useMemo(
+    () => pickLiveAction(task, trace),
+    [task, trace],
+  );
+
+  const durationSec =
+    task.status === "running"
+      ? Math.max(0, nowSec - task.created_at)
+      : task.status === "pending"
+        ? null
+        : Math.max(0, (task.updated_at ?? task.created_at) - task.created_at);
+
   return (
     <li className={`task-row task-row-${task.status}`}>
-      <span className={`task-dot task-dot-${task.status}`} />
+      <span
+        className={`task-icon task-icon-${task.status}`}
+        aria-hidden
+        title={statusLabel(task.status)}
+      >
+        {statusIcon(task.status)}
+      </span>
       <span className="task-index">{index}.</span>
       <div className="task-body">
         <div className="task-desc">{task.description}</div>
-        {task.retries > 0 && (
-          <div className="task-retries">retries: {task.retries}</div>
+        {liveAction && (
+          <div className={`task-live-action task-live-${liveAction.tone}`}>
+            <span className="task-live-arrow" aria-hidden>
+              {liveAction.tone === "error" ? "✗" : "→"}
+            </span>
+            <span className="task-live-text">{liveAction.text}</span>
+          </div>
         )}
-        {task.result && <div className="task-result">{task.result}</div>}
+        {task.retries > 0 && (
+          <div className="task-retries">
+            {task.retries} retr{task.retries === 1 ? "y" : "ies"}
+          </div>
+        )}
+        {task.result && task.status !== "running" && (
+          <div
+            className="task-result"
+            title={task.result.length > 300 ? task.result : undefined}
+          >
+            {condenseResult(task.result)}
+          </div>
+        )}
         {hasTrace && (
           <button
             className="task-trace-toggle"
@@ -373,11 +493,129 @@ function TaskRow({
         )}
         {open && hasTrace && <TraceView trace={trace!} />}
       </div>
-      <span className={`task-badge task-badge-${task.status}`}>
-        {statusLabel(task.status)}
-      </span>
+      <div className="task-row-meta">
+        {durationSec != null && (
+          <span className="task-duration" aria-label="elapsed">
+            {formatDurationSec(durationSec)}
+          </span>
+        )}
+        <span className={`task-badge task-badge-${task.status}`}>
+          {statusLabel(task.status)}
+        </span>
+      </div>
     </li>
   );
+}
+
+function runStateIcon(s: RunState): string {
+  switch (s) {
+    case "running":
+      return "⋯";
+    case "done":
+      return "✓";
+    case "failed":
+      return "✗";
+    case "cancelled":
+      return "⊘";
+    case "timeout":
+      return "⏱";
+    case "idle":
+    default:
+      return "○";
+  }
+}
+
+function statusIcon(s: TaskStatus): string {
+  switch (s) {
+    case "pending":
+      return "○";
+    case "running":
+      return "⋯";
+    case "done":
+      return "✓";
+    case "failed":
+      return "✗";
+    case "skipped":
+      return "⊘";
+  }
+}
+
+/** Format elapsed / duration in seconds as `Ns` / `M:SS` / `Hh Mm`. */
+function formatDurationSec(sec: number): string {
+  if (sec < 1) return "<1s";
+  if (sec < 60) return `${Math.floor(sec)}s`;
+  if (sec < 3600) {
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2, "0")}`;
+  }
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m.toString().padStart(2, "0")}m`;
+}
+
+/** Pick a single short line describing what's happening on this task
+ *  right now. For running tasks we surface the newest tool call; for
+ *  failed tasks we surface the first error entry; for done tasks we
+ *  return null so the UI stays quiet. */
+function pickLiveAction(
+  task: Task,
+  trace: TaskTrace | undefined,
+): { text: string; tone: "info" | "error" } | null {
+  if (!trace || trace.entries.length === 0) return null;
+  if (task.status === "running") {
+    for (let i = trace.entries.length - 1; i >= 0; i--) {
+      const e = trace.entries[i];
+      if (e.kind === "tool_call") {
+        return {
+          text: `${e.name} ${condenseArgs(e.args)}`,
+          tone: "info",
+        };
+      }
+      if (e.kind === "error") {
+        return { text: e.message, tone: "error" };
+      }
+    }
+    return null;
+  }
+  if (task.status === "failed") {
+    for (const e of trace.entries) {
+      if (e.kind === "error") {
+        return { text: e.message, tone: "error" };
+      }
+    }
+    for (const e of trace.entries) {
+      if (e.kind === "tool_result" && !e.ok) {
+        return {
+          text: condenseResult(e.output),
+          tone: "error",
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** Collapse a multi-line / JSON-blob result down to a single-line summary. */
+function condenseResult(s: string): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  const MAX = 160;
+  return one.length > MAX ? one.slice(0, MAX - 1) + "…" : one;
+}
+
+/** Trim a tool-call args blob to a short preview so the row doesn't
+ *  inherit a 400-character JSON dump on every row. */
+function condenseArgs(args: string): string {
+  const one = args.replace(/\s+/g, " ").trim();
+  const MAX = 80;
+  return one.length > MAX ? one.slice(0, MAX - 1) + "…" : one;
+}
+
+/** Display only the first 8 chars of a UUID task id so the failures
+ *  row doesn't get visually dominated by the id. Full id is still
+ *  visible on hover via `title`. */
+function shortTaskId(id: string): string {
+  return id.length > 10 ? id.slice(0, 8) : id;
 }
 
 function TraceView({ trace }: { trace: TaskTrace }) {

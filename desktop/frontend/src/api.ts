@@ -52,6 +52,8 @@ export const api = {
     tool_calls: ToolCall[];
     tool_results: ToolResult[];
     steps: StepEvent[];
+    /** How many times the executor looped before this turn ended. */
+    executor_iterations?: number;
   }> => invoke("send_chat", { projectDir: project_dir, message, history }),
 
   cancelChat: () => invoke<void>("cancel_chat"),
