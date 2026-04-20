@@ -23,6 +23,12 @@ including autonomous goal execution works end-to-end with Ollama alone.
 > not part of the running desktop system. All product code for the system
 > described in this README lives under `desktop/`.
 
+> **Coming in cold?** Start with [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md).
+> It is the single structured reference for the architecture, the state
+> model, the AI-routing rules, the known constraints, and the critical
+> files — designed so you can make an informed change without re-reading
+> the whole codebase.
+
 ---
 
 ## What the system actually is
@@ -91,17 +97,32 @@ expandable per-task trace), Chat (streaming bubbles per role), Execution
 
 ### Agent roles (all live in `ai.rs`)
 
-- **Planner** — optional. If `OPENROUTER_API_KEY` is set, the first step of a
-  chat turn and the goal decomposition go through OpenRouter for a short plan
-  and/or initial tool calls. Falls back to the executor silently if the planner
-  errors or is missing.
-- **Executor** — Ollama. Runs the bounded tool-call loop
+Each role's provider (OpenRouter vs Ollama) is resolved at call time from
+`settings.provider_mode` — `Cloud`, `Local`, or `Hybrid` — via
+`ai::resolve_provider(settings, role)`. Per-role model overrides
+(`planner_model`, `executor_model`, `reviewer_model`) are independent
+string slots; empty means "use provider default". See
+[`docs/PROVIDER_ROUTING.md`](docs/PROVIDER_ROUTING.md) for the full matrix.
+
+- **Planner** — decomposes a chat turn or goal into steps / initial tool
+  calls. In `Hybrid` mode it runs on OpenRouter with Ollama as a
+  silent fallback; in `Cloud`/`Local` it runs on the matching provider
+  with no fallback (so misconfiguration fails loudly — by design).
+- **Executor** — runs the bounded tool-call loop
   (`settings.max_iterations`, default 8, hard cap 16). Emits `ai:token`,
-  `ai:tool_call`, `ai:tool_result`, `ai:step` as it goes.
-- **Reviewer** — Ollama. Inspects the executor's output and emits either
-  `OK:` or `NEEDS_FIX: <instruction>`. `NEEDS_FIX` triggers up to
-  `max_retries_per_task` corrective attempts with the reviewer's instruction
-  fed back as feedback. Can be disabled via `settings.reviewer_enabled`.
+  `ai:tool_call`, `ai:tool_result`, `ai:step` as it goes. In `Hybrid`
+  and `Local` modes the executor is Ollama; in `Cloud` it is OpenRouter.
+- **Reviewer** — inspects the executor's *tool-call + tool-result
+  transcript* (not just the final text) and emits either `OK:` or
+  `NEEDS_FIX: <instruction>`. `NEEDS_FIX` triggers up to
+  `max_retries_per_task` corrective attempts with the feedback fed
+  back. Can be disabled via `settings.reviewer_enabled`.
+
+All three roles go through a single `ai::call_model(settings, role, …)`
+entrypoint — there are no direct `stream_openrouter` / `stream_ollama`
+call sites anywhere else in the codebase. New call sites must use it
+so provider routing, `ai:step` metadata, and 5xx retry behaviour stay
+consistent.
 
 ### Goal execution flow (`controller::start_goal`)
 
@@ -208,13 +229,16 @@ UI) without needing OpenRouter.
 
 | Setting | Value | Why |
 |---|---|---|
+| Provider mode | **Local** | Runs the full Planner / Executor / Reviewer loop on Ollama. Switch to `Hybrid` once you add an OpenRouter key, `Cloud` if you want everything on OpenRouter. See [`docs/PROVIDER_ROUTING.md`](docs/PROVIDER_ROUTING.md). |
 | Ollama base URL | `http://localhost:11434` | Default. Leave alone. |
-| Ollama model | `deepseek-coder:6.7b` | Pre-filled default. |
+| Executor model | `deepseek-coder:6.7b` | Pre-filled default for Ollama. |
+| Reviewer model | `llama3.2:1b` | Tiny & fast; only needs to emit `OK:` or `NEEDS_FIX:`. |
+| Planner model | leave blank | Defaults to the provider default in `Local` mode. |
 | Reviewer enabled | **on** | You want to see the full three-agent loop. |
 | Autonomous mode | **off** for your first few runs | So the UI stops between steps and you can watch. Flip it on once you trust the loop. |
 | Autonomous confirm irreversible | **on** | Safety net for when you do flip autonomous on later. Harmless when autonomous is off. |
 | Cmd confirm required | **on** (default) | Any shell command not on the allow-list routes through the confirm modal. |
-| OpenRouter API key | leave blank | Executor-only mode is fine for the first run. |
+| OpenRouter API key | leave blank | Executor-only mode is fine for the first run. Required for `Cloud` / `Hybrid`. |
 
 Everything else — timeouts, retries, circuit breaker — can stay at defaults.
 
