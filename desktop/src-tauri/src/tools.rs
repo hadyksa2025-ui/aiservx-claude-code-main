@@ -367,7 +367,7 @@ pub async fn execute_run_cmd_gated(
     }
 
     let (allow_list, confirm_required) = {
-        let s = state.settings.read().unwrap();
+        let s = state.read_settings();
         (s.cmd_allow_list.clone(), s.cmd_confirm_required)
     };
 

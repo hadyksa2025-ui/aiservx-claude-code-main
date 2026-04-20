@@ -51,6 +51,20 @@ use crate::{memory, tools, AppState, Settings};
 const MAX_ITERATIONS_CEILING: usize = 16;
 const MAX_REVIEWER_RETRIES: usize = 1;
 
+// Request-level retry on OpenRouter transient 5xx responses. One 502/503
+// / 504 from the upstream (or from OpenRouter's own gateway) should not
+// take out the whole planner / executor / reviewer call — we retry with
+// a short exponential backoff before giving up and letting `call_model`
+// decide whether to swing to the fallback provider.
+//
+// We retry the *initial* POST only. Once the SSE stream has started,
+// the tokens we already billed are gone; silently re-issuing the
+// request would double-bill the user for content the UI has already
+// streamed. Mid-stream failures therefore propagate up to `call_model`
+// as usual.
+const OPENROUTER_MAX_RETRIES: usize = 2;
+const OPENROUTER_RETRY_BASE_MS: u64 = 500;
+
 const PLANNER_PROMPT: &str = r#"You are the PLANNER in a multi-agent coding assistant.
 
 Your job is to read the user's request and produce a SHORT, CONCRETE plan
@@ -499,21 +513,83 @@ async fn stream_openrouter(
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(&settings.openrouter_api_key)
-        .header("HTTP-Referer", "https://github.com/salonadel6-sudo/open-claude-code-main")
-        .header("X-Title", "Open Claude Code Desktop")
-        .header("Accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("openrouter request failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("openrouter http {status}: {text}"));
-    }
+
+    // Retry the initial POST on transient errors: connection-level
+    // failures (DNS blips, TLS resets, read timeouts before the first
+    // byte) and 5xx responses from OpenRouter's gateway. We retry the
+    // POST only — once the SSE stream starts we must propagate mid-
+    // stream errors up to `call_model` so they can trigger the
+    // provider fallback instead of re-billing tokens.
+    let mut attempt: usize = 0;
+    let resp = loop {
+        if cancel.is_cancelled() {
+            return Err(cancel.err_string());
+        }
+        let send = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .bearer_auth(&settings.openrouter_api_key)
+            .header("HTTP-Referer", "https://github.com/salonadel6-sudo/open-claude-code-main")
+            .header("X-Title", "Open Claude Code Desktop")
+            .header("Accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await;
+        match send {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_success() {
+                    break r;
+                }
+                // Retry on 5xx; on 4xx (401, 403, 429, …) return
+                // immediately — those are auth / quota / prompt errors
+                // that will not heal on retry, and the dispatcher's
+                // fallback logic should handle them.
+                if status.is_server_error() && attempt < OPENROUTER_MAX_RETRIES {
+                    let text = r.text().await.unwrap_or_default();
+                    let delay = OPENROUTER_RETRY_BASE_MS * (1u64 << attempt as u64);
+                    warn!(
+                        "openrouter http {status} (attempt {}/{}), retrying in {}ms: {}",
+                        attempt + 1,
+                        OPENROUTER_MAX_RETRIES + 1,
+                        delay,
+                        truncate(&text, 200)
+                    );
+                    attempt += 1;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(cancel.err_string()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                    }
+                    continue;
+                }
+                let text = r.text().await.unwrap_or_default();
+                return Err(format!("openrouter http {status}: {text}"));
+            }
+            Err(e) => {
+                // Connection-level failure. Retry with backoff; a DNS
+                // blip or TCP reset is exactly the kind of transient
+                // error request-level retry is meant to absorb.
+                if attempt < OPENROUTER_MAX_RETRIES {
+                    let delay = OPENROUTER_RETRY_BASE_MS * (1u64 << attempt as u64);
+                    warn!(
+                        "openrouter request failed (attempt {}/{}), retrying in {}ms: {}",
+                        attempt + 1,
+                        OPENROUTER_MAX_RETRIES + 1,
+                        delay,
+                        e
+                    );
+                    attempt += 1;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(cancel.err_string()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                    }
+                    continue;
+                }
+                return Err(format!("openrouter request failed: {e}"));
+            }
+        }
+    };
 
     let mut acc = StreamAccumulator::default();
     let mut stream = resp.bytes_stream();
@@ -806,13 +882,13 @@ async fn call_provider(
 
 #[tauri::command]
 pub async fn check_planner(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let key = state.settings.read().unwrap().openrouter_api_key.clone();
+    let key = state.read_settings().openrouter_api_key.clone();
     Ok(!key.is_empty())
 }
 
 #[tauri::command]
 pub async fn check_executor(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let base = state.settings.read().unwrap().ollama_base_url.clone();
+    let base = state.read_settings().ollama_base_url.clone();
     let url = format!("{}/api/tags", base.trim_end_matches('/'));
     // 10s (up from 3s): the first probe after launching `ollama serve`
     // can stall for several seconds while the daemon warms up its
@@ -1155,6 +1231,37 @@ fn turn_cancel_token(state: &AppState) -> CancelToken {
     state.cancelled.clone()
 }
 
+/// Optionally trim chat history to the last N messages when context
+/// compaction is enabled. Returns the original history untouched when
+/// the feature is disabled or when history is already shorter than the
+/// window.
+///
+/// The window is measured in UI messages (`UiMessage`), not token
+/// count: counting tokens accurately requires a model-specific
+/// tokenizer, which we deliberately avoid to keep this helper cheap
+/// and deterministic. A too-small window is clamped to 2 so at least
+/// the last user/assistant pair survives.
+fn maybe_compact_history(mut history: Vec<UiMessage>, settings: &Settings) -> Vec<UiMessage> {
+    if !settings.context_compaction_enabled {
+        return history;
+    }
+    let keep = (settings.context_compaction_keep_last as usize).max(2);
+    if history.len() <= keep {
+        return history;
+    }
+    let dropped = history.len() - keep;
+    warn!(
+        "context compaction: dropping {} of {} history messages (keep_last={})",
+        dropped,
+        history.len(),
+        keep
+    );
+    // `drain(..dropped)` removes the oldest `dropped` entries in place;
+    // this preserves the tail without a second allocation.
+    history.drain(..dropped);
+    history
+}
+
 /// Runs a single multi-agent chat turn. Reusable by the higher-level
 /// autonomous controller (`controller::start_goal`), which does not own
 /// a `tauri::State` handle but does hold `&AppState`.
@@ -1172,7 +1279,17 @@ pub(crate) async fn run_chat_turn(
     state.cancelled.reset();
     let cancel = turn_cancel_token(state);
 
-    let settings = state.settings.read().unwrap().clone();
+    let settings = state.read_settings().clone();
+
+    // Optional context compaction: drop history messages older than the
+    // last N when the session has grown past the user's configured
+    // window. This is a simple sliding-window trim, not a summary —
+    // intentionally so: a summary-based compaction needs its own model
+    // call, budget, and error path, and the small local models this
+    // setting is meant to protect are exactly the ones whose summaries
+    // are least reliable. When disabled, history is passed through
+    // untouched and turns behave identically to before.
+    let history = maybe_compact_history(history, &settings);
     // The planner runs when its resolved provider chain has credentials.
     // In `Local` mode this is always true (Ollama needs no auth); in
     // `Cloud` mode it requires an OpenRouter key; in `Hybrid` mode we

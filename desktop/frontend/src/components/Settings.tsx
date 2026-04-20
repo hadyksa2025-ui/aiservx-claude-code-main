@@ -27,6 +27,8 @@ const DEFAULTS: Settings = {
   circuit_breaker_threshold: 5,
   max_parallel_tasks: 1,
   autonomous_confirm_irreversible: false,
+  context_compaction_enabled: false,
+  context_compaction_keep_last: 20,
 };
 
 type ProbeState =
@@ -415,6 +417,52 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               <code>write_file</code>, bypassing the allow-list)
             </span>
           </label>
+        </div>
+
+        <div className="row">
+          <label>
+            <input
+              type="checkbox"
+              checked={s.context_compaction_enabled}
+              onChange={(e) =>
+                setS({
+                  ...s,
+                  context_compaction_enabled: e.target.checked,
+                })
+              }
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Compact chat history in long sessions
+            <span
+              style={{
+                color: "#8a8a8a",
+                fontSize: 11,
+                marginLeft: 6,
+              }}
+            >
+              (drops the oldest messages past the window below; no
+              summary)
+            </span>
+          </label>
+        </div>
+        <div className="row">
+          <label>Keep last N history messages (≥ 2)</label>
+          <input
+            type="number"
+            min={2}
+            max={200}
+            value={s.context_compaction_keep_last}
+            disabled={!s.context_compaction_enabled}
+            onChange={(e) =>
+              setS({
+                ...s,
+                context_compaction_keep_last: Math.max(
+                  2,
+                  Number(e.target.value) || 20,
+                ),
+              })
+            }
+          />
         </div>
 
         <div className="row">

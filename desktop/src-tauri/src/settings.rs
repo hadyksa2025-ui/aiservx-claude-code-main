@@ -121,6 +121,22 @@ pub struct Settings {
     /// current behaviour.
     #[serde(default)]
     pub autonomous_confirm_irreversible: bool,
+    /// If true, `run_chat_turn` will drop chat history messages older
+    /// than `context_compaction_keep_last` before sending them to the
+    /// executor. This is a simple "sliding window" context compaction
+    /// — it does not summarise dropped messages, just trims the oldest
+    /// ones. Useful for small local models whose context windows are
+    /// filled by long sessions; off by default so short sessions see
+    /// no behavioural change.
+    #[serde(default)]
+    pub context_compaction_enabled: bool,
+    /// How many of the most recent chat-history messages to preserve
+    /// when `context_compaction_enabled` is true. Older messages are
+    /// dropped (not summarised). This is measured in UI messages — a
+    /// single user-then-assistant exchange counts as two. Must be >= 2;
+    /// values below 2 are silently clamped at call time.
+    #[serde(default = "default_context_compaction_keep_last")]
+    pub context_compaction_keep_last: u32,
 }
 
 fn default_true() -> bool {
@@ -156,6 +172,12 @@ fn default_circuit_breaker_threshold() -> u32 {
 }
 fn default_max_parallel_tasks() -> u32 {
     1
+}
+fn default_context_compaction_keep_last() -> u32 {
+    // 20 UI messages ≈ 10 user/assistant pairs. Comfortable for
+    // free-form chat; easy to raise/lower from Settings. Must stay at
+    // least 2 (see `context_compaction_keep_last` docs).
+    20
 }
 fn default_openrouter_model() -> String {
     std::env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into())
@@ -208,6 +230,8 @@ impl Default for Settings {
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             max_parallel_tasks: default_max_parallel_tasks(),
             autonomous_confirm_irreversible: false,
+            context_compaction_enabled: false,
+            context_compaction_keep_last: default_context_compaction_keep_last(),
         }
     }
 }
@@ -236,7 +260,7 @@ impl Settings {
 
 #[tauri::command]
 pub fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
-    Ok(state.settings.read().unwrap().clone())
+    Ok(state.read_settings().clone())
 }
 
 #[tauri::command]
@@ -245,6 +269,6 @@ pub fn save_settings(
     settings: Settings,
 ) -> Result<(), String> {
     settings.save().map_err(|e| e.to_string())?;
-    *state.settings.write().unwrap() = settings;
+    *state.write_settings() = settings;
     Ok(())
 }

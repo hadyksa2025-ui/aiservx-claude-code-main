@@ -38,7 +38,14 @@ pub fn watch_dir(
         .canonicalize()
         .map_err(|e| format!("invalid project root {project_dir}: {e}"))?;
 
-    let mut map = state.watchers.inner.lock().unwrap();
+    let mut map = state
+        .watchers
+        .inner
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            tracing::warn!("watchers Mutex poisoned on watch_dir; recovering inner guard");
+            poisoned.into_inner()
+        });
     if map.contains_key(&project_dir) {
         return Ok(());
     }
@@ -99,7 +106,14 @@ pub fn unwatch_dir(
     state: tauri::State<'_, AppState>,
     project_dir: String,
 ) -> Result<(), String> {
-    let mut map = state.watchers.inner.lock().unwrap();
+    let mut map = state
+        .watchers
+        .inner
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            tracing::warn!("watchers Mutex poisoned on unwatch_dir; recovering inner guard");
+            poisoned.into_inner()
+        });
     map.remove(&project_dir);
     Ok(())
 }

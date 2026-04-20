@@ -88,6 +88,20 @@ export type Settings = {
    * current behaviour.
    */
   autonomous_confirm_irreversible: boolean;
+  /**
+   * If true, `send_chat` / autonomous task turns drop chat-history
+   * messages older than {@link context_compaction_keep_last} before
+   * calling the model. This is a plain sliding-window trim, not a
+   * summary. Useful for small local models whose context fills up in
+   * long sessions.
+   */
+  context_compaction_enabled: boolean;
+  /**
+   * How many of the most recent history messages to preserve when
+   * {@link context_compaction_enabled} is true. Older messages are
+   * dropped. Clamped at 2 by the backend.
+   */
+  context_compaction_keep_last: number;
 };
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "skipped";

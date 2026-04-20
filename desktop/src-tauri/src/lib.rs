@@ -12,11 +12,11 @@
 //! `src/` is a read-only research snapshot and is intentionally out of scope.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tauri::Manager;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod ai;
@@ -66,6 +66,47 @@ pub struct AppState {
     /// warning. The lock is only held for the microsecond-scale
     /// `insert`/`remove` so the async lock's cost is negligible.
     pub pending_confirms: AsyncMutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+impl AppState {
+    /// Acquire a read guard on `settings`, recovering transparently if
+    /// the lock is poisoned (another thread panicked while holding a
+    /// write guard).
+    ///
+    /// A poisoned lock is almost always benign here: `Settings` is a
+    /// plain data struct and a panic during read/clone leaves it in a
+    /// perfectly usable state. Without this recovery, every subsequent
+    /// `send_chat` / `start_goal` / `run_cmd` would panic on
+    /// `unwrap()`, turning one transient failure into a hard crash of
+    /// the whole AI backend. We log once per recovery so ops can still
+    /// see it in the trace.
+    pub(crate) fn read_settings(&self) -> RwLockReadGuard<'_, Settings> {
+        self.settings.read().unwrap_or_else(|poisoned| {
+            warn!("settings RwLock poisoned on read; recovering inner guard");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Acquire a write guard on `settings`, recovering transparently if
+    /// the lock is poisoned. See [`AppState::read_settings`] for
+    /// rationale.
+    pub(crate) fn write_settings(&self) -> RwLockWriteGuard<'_, Settings> {
+        self.settings.write().unwrap_or_else(|poisoned| {
+            warn!("settings RwLock poisoned on write; recovering inner guard");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Acquire the `goal_running` guard, recovering from poison. The
+    /// `bool` inside is a simple idempotency flag: a poisoned lock
+    /// cannot corrupt it in any meaningful way, so we just take the
+    /// inner value and continue.
+    pub(crate) fn lock_goal_running(&self) -> MutexGuard<'_, bool> {
+        self.goal_running.lock().unwrap_or_else(|poisoned| {
+            warn!("goal_running Mutex poisoned; recovering inner guard");
+            poisoned.into_inner()
+        })
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

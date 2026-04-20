@@ -109,7 +109,7 @@ pub async fn start_goal(
     // Another `start_goal` call while one is already in flight would mutate
     // the same shared cancellation flags and emit interleaved task events.
     {
-        let mut running = state.goal_running.lock().unwrap();
+        let mut running = state.lock_goal_running();
         if *running {
             return Err("a goal is already running; cancel it first".into());
         }
@@ -120,7 +120,7 @@ pub async fn start_goal(
     struct RunningGuard<'a>(&'a AppState);
     impl<'a> Drop for RunningGuard<'a> {
         fn drop(&mut self) {
-            *self.0.goal_running.lock().unwrap() = false;
+            *self.0.lock_goal_running() = false;
         }
     }
     let _running_guard = RunningGuard(&state);
@@ -150,7 +150,7 @@ pub async fn start_goal(
         }),
     );
 
-    let settings = state.settings.read().unwrap().clone();
+    let settings = state.read_settings().clone();
     let max_total = settings.max_total_tasks.max(1) as usize;
     let goal_timeout_secs = settings.goal_timeout_secs;
 
@@ -935,7 +935,7 @@ async fn review_task(
     task_desc: &str,
     executor_summary: &str,
 ) -> ReviewDecision {
-    let reviewer_enabled = state.settings.read().unwrap().reviewer_enabled;
+    let reviewer_enabled = state.read_settings().reviewer_enabled;
     if !reviewer_enabled || executor_summary.trim().is_empty() {
         return ReviewDecision::Unknown(executor_summary.into());
     }
