@@ -24,7 +24,7 @@
 │  ┌─────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ┌─────────────┐  │
 │  │  Explorer   │    │   Goal & Tasks   │    │        Chat         │    │   Debug     │  │
 │  │ (file tree) │    │ TaskPanel.tsx    │    │ Chat.tsx (3-tier)   │    │ Execution…  │  │
-│  │ FileTree…   │    │ status icons,    │    │ Thinking /           │    │ tool_call / │  │
+│  │ Explorer…   │    │ status icons,    │    │ Thinking /           │    │ tool_call / │  │
 │  │             │    │ live timing,     │    │ FinalAnswer /        │    │ tool_result │  │
 │  │ collapsible │    │ progressbar,     │    │ SystemAction         │    │ ring-buffer │  │
 │  │ (36 px rail)│    │ inline tool call │    │ + provider/model     │    │ 500 entries │  │
@@ -408,7 +408,7 @@ emitter cannot grow `events` beyond 500 entries.
 | `components/TaskPanel.tsx` | Goal + task tree, status icons, live timers, progressbar. |
 | `components/Execution.tsx` | Debug pane: agent timeline + virtualised event list. |
 | `components/Settings.tsx` | Settings modal (provider mode, per-role models, Test OpenRouter). |
-| `components/FileTree.tsx` | Explorer pane. |
+| `components/Explorer.tsx` | Explorer pane. |
 
 ### Docs
 
