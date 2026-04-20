@@ -10,6 +10,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - This snapshot is not a normal clean checkout: some generated/runtime assets expected by the app may be missing.
 - README context matters here: this repo is intended for educational study, defensive security research, architecture review, and supply-chain analysis.
 
+## Start here for the desktop app
+
+If the task involves the `desktop/` subtree (the Tauri + React Open
+Claude Code app that lives alongside the snapshot), read
+[`PROJECT_MEMORY.md`](PROJECT_MEMORY.md) before anything else. It is the
+authoritative, continuously-updated reference for the desktop system's
+architecture, AI-routing rules, state model (`store.ts`), UI tiers, event
+flow, and known constraints. Keep it in sync with any non-trivial change
+you make (new store slice, new event, new provider behaviour, new UX
+affordance) — update it in the **same PR** as the change, not after.
+
 ## Common commands
 
 ### Install / environment
