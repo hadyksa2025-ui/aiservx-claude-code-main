@@ -460,6 +460,9 @@ async fn execute_task_with_retries(
             context,
             Vec::<UiMessage>::new(),
             autonomous_confirm,
+            // Autonomous tasks are free-form prose (and tool calls),
+            // not a JSON plan. `json_mode = false`.
+            false,
         );
         let turn = if task_timeout_secs > 0 {
             match timeout(Duration::from_secs(task_timeout_secs), fut).await {
@@ -725,6 +728,13 @@ async fn plan_goal(
         full.clone(),
         Vec::<UiMessage>::new(),
         false,
+        // Goal planner — force JSON output. On OpenRouter this
+        // sets `response_format: {type: "json_object"}`; on Ollama
+        // it sets `format: "json"`. Both semantically constrain the
+        // model to a valid JSON object, dramatically reducing the
+        // prose/markdown wrapping that small local models tend to
+        // emit.
+        true,
     )
     .await?;
     let text = resp.assistant.trim().to_string();
@@ -748,6 +758,10 @@ async fn plan_goal(
         reprompt,
         Vec::<UiMessage>::new(),
         false,
+        // Retry also in JSON mode — the retry reprompt is explicit
+        // about wanting JSON, so enforcement at the API level still
+        // helps.
+        true,
     )
     .await?;
     let retry_text = retry_resp.assistant.trim().to_string();
@@ -950,6 +964,9 @@ async fn review_task(
         project_dir.to_string(),
         prompt,
         Vec::<UiMessage>::new(),
+        false,
+        // Task reviewer output is "OK: …" / "NEEDS_FIX: …",
+        // never JSON. `json_mode = false`.
         false,
     )
     .await
