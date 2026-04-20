@@ -25,6 +25,11 @@ export default function App() {
   const [events, setEvents] = useState<ExecutionEvent[]>([]);
   const [fsTick, setFsTick] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The execution pane is a developer-facing debug view. Collapsed by
+  // default so a fresh install doesn't greet the user with a raw
+  // event stream; pops back open automatically on the first error so
+  // failures are never silently hidden.
+  const [debugOpen, setDebugOpen] = useState(false);
 
   // Health check on mount and when settings close
   const refreshHealth = useCallback(async () => {
@@ -72,12 +77,16 @@ export default function App() {
       ),
     );
     unlistens.push(
-      onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) =>
+      onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) => {
         setEvents((prev) => [
           ...prev,
           { kind: "error", text: p.message, role: p.role, at: Date.now() },
-        ]),
-      ),
+        ]);
+        // Surface the debug panel the moment anything goes wrong — a
+        // silent collapsed panel on a failed run is exactly the kind
+        // of UX the audit flagged.
+        setDebugOpen(true);
+      }),
     );
     unlistens.push(
       onEvent<FsChange>("fs:changed", () => setFsTick((t) => t + 1)),
@@ -171,7 +180,11 @@ export default function App() {
         <button onClick={() => setSettingsOpen(true)}>Settings</button>
       </div>
 
-      <div className="panes panes-4">
+      <div
+        className={`panes panes-4${
+          debugOpen ? "" : " panes-debug-collapsed"
+        }`}
+      >
         <div className="pane">
           <div className="pane-header">Explorer</div>
           <div className="pane-body">
@@ -207,20 +220,41 @@ export default function App() {
           </div>
         </div>
 
-        <div className="pane">
+        <div className={`pane pane-debug${debugOpen ? "" : " pane-collapsed"}`}>
           <div className="pane-header">
-            Execution
-            <div style={{ flex: 1 }} />
             <button
-              onClick={() => setEvents([])}
-              style={{ fontSize: 10, padding: "2px 6px" }}
+              className="pane-toggle"
+              onClick={() => setDebugOpen((v) => !v)}
+              aria-expanded={debugOpen}
+              aria-label={debugOpen ? "collapse debug panel" : "expand debug panel"}
+              title={debugOpen ? "Collapse" : "Expand"}
+              type="button"
             >
-              clear
+              <span className="pane-caret" aria-hidden>
+                {debugOpen ? "▾" : "▸"}
+              </span>
+              Debug
             </button>
+            {events.length > 0 && (
+              <span className="pane-header-count" aria-label="event count">
+                {events.length}
+              </span>
+            )}
+            <div style={{ flex: 1 }} />
+            {debugOpen && (
+              <button
+                onClick={() => setEvents([])}
+                style={{ fontSize: 10, padding: "2px 6px" }}
+              >
+                clear
+              </button>
+            )}
           </div>
-          <div className="pane-body">
-            <Execution events={events} />
-          </div>
+          {debugOpen && (
+            <div className="pane-body">
+              <Execution events={events} />
+            </div>
+          )}
         </div>
       </div>
 

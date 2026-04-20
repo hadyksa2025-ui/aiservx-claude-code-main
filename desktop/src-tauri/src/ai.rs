@@ -262,6 +262,13 @@ pub struct ChatResponse {
     pub tool_results: Vec<UiToolResult>,
     /// Ordered list of agent steps that happened during this turn.
     pub steps: Vec<StepSummary>,
+    /// How many times the executor looped before this turn ended.
+    /// Matches the `iterations` field already carried on the
+    /// `ai:done` event. Exposed on the RPC response too so the UI can
+    /// attribute a finished turn without having to cross-reference
+    /// event history (audit Addendum §2.9).
+    #[serde(default)]
+    pub executor_iterations: u32,
     /// Full execution transcript for this turn. For a chat-initiated
     /// turn this is discarded; the controller attaches it to the active
     /// task when driving the autonomous loop.
@@ -1709,6 +1716,7 @@ pub(crate) async fn run_chat_turn(
         tool_calls: all_tool_calls,
         tool_results: all_tool_results,
         steps,
+        executor_iterations: executor_iterations as u32,
         trace,
     })
 }

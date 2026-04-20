@@ -147,6 +147,9 @@ textarea:focus {
 .panes-4 {
   grid-template-columns: 240px 320px 1fr 360px;
 }
+.panes-4.panes-debug-collapsed {
+  grid-template-columns: 240px 320px 1fr 36px;
+}
 
 .pane {
   display: flex;
@@ -175,6 +178,66 @@ textarea:focus {
   flex: 1;
   overflow: auto;
   min-height: 0;
+}
+
+/* ---------- Collapsible Debug pane (Phase 4) ---------- */
+.pane-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--fg-dim);
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+.pane-toggle:hover {
+  color: var(--fg);
+}
+.pane-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+.pane-caret {
+  display: inline-block;
+  width: 10px;
+  color: var(--fg-dim);
+}
+.pane-header-count {
+  font-size: 10px;
+  background: var(--bg-3);
+  color: var(--fg-dim);
+  border-radius: 999px;
+  padding: 1px 8px;
+  letter-spacing: 0;
+  text-transform: none;
+  min-width: 18px;
+  text-align: center;
+}
+.pane.pane-collapsed {
+  width: 36px;
+}
+.pane.pane-collapsed .pane-header {
+  padding: 8px 6px;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  height: 100%;
+  border-bottom: 0;
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+.pane.pane-collapsed .pane-toggle {
+  flex-direction: column;
+  gap: 4px;
+}
+.pane.pane-collapsed .pane-header-count {
+  writing-mode: horizontal-tb;
+  transform: rotate(180deg);
 }
 
 /* ---------- Explorer ---------- */
@@ -572,13 +635,22 @@ textarea:focus {
 }
 
 .task-status-chip {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 2px 8px;
   border-radius: 10px;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   border: 1px solid var(--border);
+}
+.task-status-chip .task-icon {
+  width: 14px;
+  height: 14px;
+  background: transparent;
+  border: 0;
+  font-size: 10px;
 }
 .task-status-chip.task-status-running { background: #1d3557; color: #9ecbff; border-color: #315585; }
 .task-status-chip.task-status-done    { background: #1b3b26; color: #a4e8b2; border-color: #2f6b47; }
@@ -700,6 +772,106 @@ textarea:focus {
 .task-dot-done    { background: #3fb950; }
 .task-dot-failed  { background: #ff7676; }
 .task-dot-skipped { background: #aaa; }
+
+/* ---------- Task status icons (Phase 4) ---------- */
+.task-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  font-variant-numeric: tabular-nums;
+}
+.task-icon-pending  { color: var(--fg-dim);  background: var(--bg-3); border-color: var(--border); }
+.task-icon-running  { color: #9ecbff;        background: #1d3557;     border-color: #315585; animation: task-icon-pulse 1.4s ease-in-out infinite; }
+.task-icon-done     { color: #a4e8b2;        background: #1b3b26;     border-color: #2f6b47; }
+.task-icon-failed   { color: #ff9b9b;        background: #4a1f1f;     border-color: #803131; }
+.task-icon-skipped  { color: var(--fg-dim);  background: var(--bg-3); border-color: var(--border); }
+.task-icon-goal-running   { color: #9ecbff; }
+.task-icon-goal-done      { color: #a4e8b2; }
+.task-icon-goal-failed    { color: #ff9b9b; }
+.task-icon-goal-cancelled { color: var(--fg-dim); }
+.task-icon-goal-timeout   { color: #ffd28c; }
+.task-icon-goal-idle      { color: var(--fg-dim); }
+@keyframes task-icon-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-icon-running { animation: none; }
+}
+
+/* ---------- Per-task duration + progress extras (Phase 4) ---------- */
+.task-row-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.task-duration {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.task-goal-duration {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.task-progress-running {
+  font-size: 10px;
+  color: #9ecbff;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(29, 53, 87, 0.45);
+  border: 1px solid #315585;
+}
+.task-progress-failed {
+  font-size: 10px;
+  color: #ff9b9b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(74, 31, 31, 0.35);
+  border: 1px solid #803131;
+}
+
+/* ---------- Inline live action on a task row (Phase 4) ---------- */
+.task-live-action {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.task-live-info  { color: #9ecbff; }
+.task-live-error { color: #ff9b9b; }
+.task-live-arrow {
+  flex: 0 0 auto;
+  opacity: 0.8;
+}
+.task-live-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .task-index {
   font-family: var(--mono);
