@@ -17,6 +17,13 @@ import { SettingsModal } from "./components/Settings";
 import { ConfirmCmdOverlay } from "./components/ConfirmCmd";
 import { TaskPanel } from "./components/TaskPanel";
 
+/**
+ * Maximum number of entries the in-memory execution-event ring buffer
+ * keeps. Once reached, the oldest entries are dropped so long
+ * autonomous runs can't OOM the renderer. Audit §7.7 / addendum §2.
+ */
+const EVENTS_CAP = 500;
+
 export default function App() {
   const [projectDir, setProjectDir] = useState<string | null>(null);
   const [plannerOk, setPlannerOk] = useState<boolean | null>(null);
@@ -30,6 +37,23 @@ export default function App() {
   // event stream; pops back open automatically on the first error so
   // failures are never silently hidden.
   const [debugOpen, setDebugOpen] = useState(false);
+  const [explorerOpen, setExplorerOpen] = useState(true);
+
+  /**
+   * Append an entry to the execution-event log and trim the tail so the
+   * buffer can never balloon past {@link EVENTS_CAP} entries. Without
+   * this cap a long autonomous run emits a step every few seconds plus
+   * every tool call/result, and the `Execution` list grew unbounded —
+   * audit §7.7 / addendum §2 flagged this as a production risk
+   * (memory churn + scroll jank). Keeping only the tail is safe
+   * because the UI already shows newest-first with a "clear" button.
+   */
+  const pushEvent = useCallback((e: ExecutionEvent) => {
+    setEvents((prev) => {
+      const next = prev.length >= EVENTS_CAP ? prev.slice(-(EVENTS_CAP - 1)) : prev;
+      return [...next, e];
+    });
+  }, []);
 
   // Health check on mount and when settings close
   const refreshHealth = useCallback(async () => {
@@ -54,34 +78,27 @@ export default function App() {
     const unlistens: Array<Promise<() => void>> = [];
     unlistens.push(
       onEvent<ToolCall>("ai:tool_call", (p) =>
-        setEvents((prev) => [
-          ...prev,
-          { kind: "tool_call", call: p, at: Date.now() },
-        ]),
+        pushEvent({ kind: "tool_call", call: p, at: Date.now() }),
       ),
     );
     unlistens.push(
       onEvent<ToolResult>("ai:tool_result", (p) =>
-        setEvents((prev) => [
-          ...prev,
-          { kind: "tool_result", result: p, at: Date.now() },
-        ]),
+        pushEvent({ kind: "tool_result", result: p, at: Date.now() }),
       ),
     );
     unlistens.push(
       onEvent<StepEvent>("ai:step", (p) =>
-        setEvents((prev) => [
-          ...prev,
-          { kind: "step", step: p, at: Date.now() },
-        ]),
+        pushEvent({ kind: "step", step: p, at: Date.now() }),
       ),
     );
     unlistens.push(
       onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) => {
-        setEvents((prev) => [
-          ...prev,
-          { kind: "error", text: p.message, role: p.role, at: Date.now() },
-        ]);
+        pushEvent({
+          kind: "error",
+          text: p.message,
+          role: p.role,
+          at: Date.now(),
+        });
         // Surface the debug panel the moment anything goes wrong — a
         // silent collapsed panel on a failed run is exactly the kind
         // of UX the audit flagged.
@@ -96,6 +113,8 @@ export default function App() {
         void p.then((fn) => fn());
       }
     };
+    // `pushEvent` is stable — it's a useCallback with no deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Watcher lifecycle tied to the opened project.
@@ -106,14 +125,11 @@ export default function App() {
       try {
         await api.watchDir(projectDir);
       } catch (e) {
-        setEvents((prev) => [
-          ...prev,
-          {
-            kind: "error",
-            text: `Failed to start watcher: ${String(e)}`,
-            at: Date.now(),
-          },
-        ]);
+        pushEvent({
+          kind: "error",
+          text: `Failed to start watcher: ${String(e)}`,
+          at: Date.now(),
+        });
       }
     })();
     return () => {
@@ -154,51 +170,93 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="topbar">
+      <header className="topbar" role="banner">
         <h1>Open Claude Code</h1>
         <button onClick={openProject}>Open project…</button>
-        <span className="project-path">{projectDir ?? "no project"}</span>
+        <span className="project-path" title={projectDir ?? undefined}>
+          {projectDir ?? "no project"}
+        </span>
         <div className="spacer" />
-        <span className="status-badge">
+        <span
+          className="status-badge"
+          role="status"
+          aria-live="polite"
+          title={statusPlanner}
+        >
           <span
             className={
               "status-dot " +
               (plannerOk === null ? "" : plannerOk ? "ok" : "bad")
             }
+            aria-hidden
           />
           {statusPlanner}
         </span>
-        <span className="status-badge">
+        <span
+          className="status-badge"
+          role="status"
+          aria-live="polite"
+          title={statusExecutor}
+        >
           <span
             className={
               "status-dot " +
               (executorOk === null ? "" : executorOk ? "ok" : "bad")
             }
+            aria-hidden
           />
           {statusExecutor}
         </span>
-        <button onClick={() => setSettingsOpen(true)}>Settings</button>
-      </div>
+        <button onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+          Settings
+        </button>
+      </header>
 
       <div
         className={`panes panes-4${
-          debugOpen ? "" : " panes-debug-collapsed"
-        }`}
+          explorerOpen ? "" : " panes-explorer-collapsed"
+        }${debugOpen ? "" : " panes-debug-collapsed"}`}
       >
-        <div className="pane">
-          <div className="pane-header">Explorer</div>
-          <div className="pane-body">
-            {projectDir ? (
-              <Explorer key={projectDir + ":" + fsTick} projectDir={projectDir} />
-            ) : (
-              <div className="empty-state">
-                Open a project folder to see its files.
-              </div>
-            )}
+        <section
+          className={`pane pane-explorer${
+            explorerOpen ? "" : " pane-collapsed"
+          }`}
+          aria-label="Explorer"
+        >
+          <div className="pane-header">
+            <button
+              className="pane-toggle"
+              onClick={() => setExplorerOpen((v) => !v)}
+              aria-expanded={explorerOpen}
+              aria-label={
+                explorerOpen ? "collapse explorer" : "expand explorer"
+              }
+              title={explorerOpen ? "Collapse" : "Expand"}
+              type="button"
+            >
+              <span className="pane-caret" aria-hidden>
+                {explorerOpen ? "▾" : "▸"}
+              </span>
+              Explorer
+            </button>
           </div>
-        </div>
+          {explorerOpen && (
+            <div className="pane-body">
+              {projectDir ? (
+                <Explorer
+                  key={projectDir + ":" + fsTick}
+                  projectDir={projectDir}
+                />
+              ) : (
+                <div className="empty-state">
+                  Open a project folder to see its files.
+                </div>
+              )}
+            </div>
+          )}
+        </section>
 
-        <div className="pane">
+        <section className="pane" aria-label="Goal and tasks">
           <div className="pane-header">Goal &amp; Tasks</div>
           <div className="pane-body">
             <TaskPanel
@@ -206,9 +264,9 @@ export default function App() {
               disabled={!projectDir || executorOk === false}
             />
           </div>
-        </div>
+        </section>
 
-        <div className="pane">
+        <section className="pane" aria-label="Chat">
           <div className="pane-header">Chat</div>
           <div className="pane-body chat">
             <Chat
@@ -218,9 +276,12 @@ export default function App() {
               disabled={!projectDir || executorOk === false}
             />
           </div>
-        </div>
+        </section>
 
-        <div className={`pane pane-debug${debugOpen ? "" : " pane-collapsed"}`}>
+        <section
+          className={`pane pane-debug${debugOpen ? "" : " pane-collapsed"}`}
+          aria-label="Debug"
+        >
           <div className="pane-header">
             <button
               className="pane-toggle"
@@ -236,8 +297,14 @@ export default function App() {
               Debug
             </button>
             {events.length > 0 && (
-              <span className="pane-header-count" aria-label="event count">
+              <span
+                className="pane-header-count"
+                aria-label={`${events.length} event${
+                  events.length === 1 ? "" : "s"
+                }`}
+              >
                 {events.length}
+                {events.length >= EVENTS_CAP && "+"}
               </span>
             )}
             <div style={{ flex: 1 }} />
@@ -255,7 +322,7 @@ export default function App() {
               <Execution events={events} />
             </div>
           )}
-        </div>
+        </section>
       </div>
 
       {settingsOpen && (

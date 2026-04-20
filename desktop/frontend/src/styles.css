@@ -150,6 +150,33 @@ textarea:focus {
 .panes-4.panes-debug-collapsed {
   grid-template-columns: 240px 320px 1fr 36px;
 }
+.panes-4.panes-explorer-collapsed {
+  grid-template-columns: 36px 320px 1fr 360px;
+}
+.panes-4.panes-explorer-collapsed.panes-debug-collapsed {
+  grid-template-columns: 36px 320px 1fr 36px;
+}
+
+/* Narrow viewport: collapse Explorer + Debug rails and shrink the Goal
+   pane so the Chat column always has breathing room. Viewport widths
+   below ~960 CSS-px already forced the user to horizontally scroll
+   before this. */
+@media (max-width: 1100px) {
+  .panes-4 {
+    grid-template-columns: 200px 280px 1fr 280px;
+  }
+}
+@media (max-width: 900px) {
+  .panes-4,
+  .panes-4.panes-debug-collapsed,
+  .panes-4.panes-explorer-collapsed,
+  .panes-4.panes-explorer-collapsed.panes-debug-collapsed {
+    grid-template-columns: 36px 1fr 36px;
+  }
+  .panes-4 > section.pane:nth-child(2) {
+    display: none;
+  }
+}
 
 .pane {
   display: flex;
@@ -228,8 +255,14 @@ textarea:focus {
   transform: rotate(180deg);
   height: 100%;
   border-bottom: 0;
-  border-left: 1px solid var(--border);
   overflow: hidden;
+}
+/* Debug sits on the right edge and already has no right border via
+   `.pane:last-child`; draw a left border on its collapsed header so
+   the rail reads as a divider. Explorer sits on the left edge and
+   inherits the right border from `.pane` base rules. */
+.pane.pane-debug.pane-collapsed .pane-header {
+  border-left: 1px solid var(--border);
 }
 .pane.pane-collapsed .pane-toggle {
   flex-direction: column;
