@@ -452,5 +452,234 @@ emitter cannot grow `events` beyond 500 entries.
 
 ---
 
+## 9. Scenario A — Local hello-world validation findings
+
+> Captured during a real usage session on 2026-04-20, provider mode =
+> `Local`, executor model = `llama3.2:1b` (Ollama, running on `:11434`),
+> fresh project directory `/home/ubuntu/oc-test-run`. Goal submitted:
+> *"Create a file HELLO.md in the project root with the single line
+> 'Hello from Open Claude Code.', then run `ls -1` and confirm HELLO.md
+> is listed."*
+>
+> Scope note: every finding below is a **real observation from driving
+> the live Tauri binary**, not a theoretical review. Each is paired with
+> a concrete file/line reference when applicable.
+
+### 9.1 What worked (confirms earlier phases)
+
+- **Provider/model badge metadata (Phase 2) is wired end-to-end.** Every
+  agent bubble in the Chat pane rendered a pair of pills: the role
+  (`PLANNER` / `EXECUTOR` / `REVIEWER`) plus `OLLAMA llama3.2:1b`. No
+  `openrouter` badge ever appeared while in Local mode — `ai:step`
+  metadata + `resolve_provider` are honest.
+- **Debug pane auto-opens and populates correctly.** As soon as the goal
+  started, the right-hand Debug pane opened on its own and its Agent
+  Timeline streamed the per-role state transitions (`PLANNER planning →
+  ✓`, `EXECUTOR step 1 → ✓`, `REVIEWER reviewing → review skipped`).
+  The event counter advanced monotonically (0 → 12 across the run).
+- **Elapsed-time counters on the thinking blocks work.** Each collapsed
+  agent block displayed a stable duration once its step ended (`2m17s`,
+  `2m00s`, `1.4s`), matching the real wall-clock time spent in that
+  step. `<ref_snippet file="desktop/frontend/src/components/ThinkingBlock.tsx" lines="1-40" />`
+  is the source of truth for this.
+- **SystemAction tier 3 rendering fires on lifecycle transitions.** The
+  cancel action surfaced as a single muted pill
+  `• [executor] error: cancelled: goal`, not a full bubble. Phase 3's
+  three-tier hierarchy is behaving as designed for system events.
+- **Ollama health probe is honest.** The top-right
+  `• ollama online` badge was green while Ollama was up and flipped to
+  warning when the daemon was restarted mid-session. `probe_ollama`
+  works.
+
+### 9.2 Critical findings (block the golden path)
+
+#### F-1. `check_planner` lies when `provider_mode = local`
+
+- **Symptom.** Topbar permanently shows `• planner off` (red dot) even
+  though the planner is running successfully via Ollama. The badge
+  colour misleads users into thinking the app is misconfigured.
+- **Root cause.** <ref_snippet file="desktop/src-tauri/src/ai.rs" lines="930-934" /> —
+  `check_planner` returns `Ok(!openrouter_api_key.is_empty())`.
+  It has no awareness of `ProviderMode`; in Local mode the correct
+  answer is "planner is reachable iff Ollama is reachable and an
+  ollama_model is configured for the planner role".
+- **Fix direction.** Route `check_planner` through
+  `resolve_provider(settings, Role::Planner).primary` and probe
+  reachability of whichever provider that resolves to. Mirror the same
+  pattern for `check_executor` and `check_reviewer`.
+- **Severity.** High — visually scary, but does not actually block
+  execution. Still costs trust on first run in Local mode.
+
+#### F-2. TaskPanel stays on "Running…" with zero task rows for the entire planning phase
+
+- **Symptom.** After clicking `Start goal`, the Goal & Tasks pane shows
+  only the placeholder copy ("The autonomous task engine will decompose
+  your goal into tasks and execute them in order. You will see each
+  task's status here.") for the full 2+ minute planning phase. No
+  spinner, no "planning…" chip, no partial tasks. Tasks only appear
+  **after the plan JSON finishes streaming or the goal is cancelled**.
+- **Root cause hypothesis.** The planner's streaming output is only
+  surfaced to the TaskPanel after `parse_plan_json` succeeds in
+  `controller.rs`. Streaming partial JSON is rendered as a Chat bubble
+  instead of being reflected as "planner is thinking" in the task pane.
+- **Fix direction.** Emit a synthetic status event the moment
+  `start_goal` begins (before planner streaming starts): `{ kind:
+  "planning", text: "Planner is drafting the task list…" }` → TaskPanel
+  shows a dedicated `⋯ planning` chip with a live counter. The Chat
+  planner bubble can remain but is no longer the only signal.
+- **Severity.** High. In Local mode on a small CPU, planning can take
+  2+ minutes and the user has zero feedback that anything is
+  progressing.
+
+#### F-3. Cancelled goal shows 100% green progress bar
+
+- **Symptom.** After clicking `Cancel`, the TaskPanel summary line
+  reads `• CANCELLED · 2/2 · 100%` with the progress bar fully filled
+  in the success colour.
+- **Impression.** Visually indistinguishable from a successfully
+  completed goal at a glance.
+- **Fix direction.** Progress bar should count only `✓ done` tasks in
+  the numerator. Cancelled/skipped tasks should not contribute to "100%"
+  and the bar fill colour must key off overall state
+  (`cancelled → var(--amber)`, `failed → var(--red)`,
+  `done → var(--green)`).
+- **Severity.** Medium. Mis-communicates a cancellation as a success.
+
+#### F-4. `llama3.2:1b` cannot drive the executor — no tool-calls emitted
+
+- **Symptom.** The executor bubble streams yet another
+  `{ "tasks": [ … ] }` JSON (a planner-style decomposition) instead of
+  tool-call markup. Reviewer then logs
+  `review skipped (unparsed)`. Nothing writes to disk — `HELLO.md` does
+  not exist afterwards.
+- **Not a bug per se.** This is a *model capability* floor: the 1 B
+  parameter model is too small to reliably follow the tool-call prompt.
+  The system behaves correctly given bad output (reviewer detects
+  "unparsed" and bails instead of pretending to succeed).
+- **But it is a product problem.** The Settings UI lets a user pick any
+  Ollama tag with no guidance. A user who picks `llama3.2:1b` because
+  it's small will hit a quiet, confusing dead end.
+- **Fix direction.**
+  1. Add a Settings-time warning when the chosen
+     `ollama_model` has ≤ 3 B parameters (heuristic by tag name) for
+     any role other than Reviewer.
+  2. Make the "review skipped (unparsed)" annotation louder — bubble it
+     up as a `SystemAction` with copy like *"Executor output could not
+     be parsed as tool calls. Try a larger executor model (≥ 7 B)."*
+  3. Document a tested minimum in `docs/PROVIDER_ROUTING.md`
+     ("executor: ≥ 7 B; reviewer: ≥ 3 B; planner: ≥ 3 B").
+- **Severity.** High. Without it, "Local mode with any Ollama model"
+  is a promise the product cannot keep.
+
+#### F-5. Phase 3 `classifyMessages` misclassifies planner output as FinalAnswer during streaming
+
+- **Symptom.** While the planner JSON is still streaming, the bubble
+  renders as a blue `ANSWER` `FinalAnswerBubble`. Once a later agent
+  bubble arrives (executor / reviewer), the earlier planner bubble is
+  retroactively reclassified to a `ThinkingBlock`. The transition is
+  visually abrupt.
+- **Root cause.** <ref_snippet file="desktop/frontend/src/components/Chat.tsx" lines="40-90" /> —
+  `classifyMessages` picks "the last non-reviewer assistant message in
+  the turn" as `final`. During planning that's the planner itself.
+- **Fix direction.** Two options, pick one:
+  - **(a)** If `m.streaming_role === "planner"`, force tier =
+    `thinking`, regardless of whether it's the last bubble in the turn.
+    Cheap and targeted.
+  - **(b)** Only mark a bubble `final` once its step has ended
+    (`done: true` on the `ai:step` event). Cleaner but requires
+    threading `done`/`running` state into the classifier.
+- **Severity.** Medium. Not broken at rest, only during streaming. But
+  it's the first thing a new user sees, so it sets the tone.
+
+### 9.3 Process / workflow findings
+
+#### F-6. The Tauri process is killable from the dev shell
+
+- **Symptom.** Running any command in the same interactive Bash shell
+  that launched `open-claude-code-desktop` (even a trivial `pgrep`)
+  occasionally caused the app to disappear. Relaunching with
+  `nohup … &; disown` in a **dedicated** shell was stable across the
+  rest of the session.
+- **Implication for this file.** Any future validation run must launch
+  the app via its own shell id (and strongly prefer `nohup` + `disown`)
+  and never reuse that shell for probes. Not a product bug, but a real
+  validation hazard.
+
+#### F-7. Planning is slow on CPU-only Ollama (`llama3.2:1b`)
+
+- **Observation.** On this VM (no GPU), planning a simple two-step
+  goal took ~2m17s wall-clock. The three-agent loop's end-to-end worst
+  case on `llama3.2:1b` easily exceeds 5 minutes even when the model
+  actually cooperates.
+- **Implication.** The goal-level `goal_timeout_secs` default of
+  `3600` is fine, but the per-task `task_timeout_secs` default of
+  `600` is tight for slow local models. A first-run user with a small
+  Ollama model may see spurious task timeouts. Consider surfacing a
+  "Slow local model?" auto-tune that raises timeouts if the planner
+  roundtrip exceeds 60 s.
+
+#### F-8. Last-project is not persisted across app restarts
+
+- **Symptom.** Closing and relaunching the binary returns to
+  `no project`. The user has to re-run "Open project…" every time.
+- **Fix direction.** Persist `projectDir` in `settings.rs` (or a tiny
+  `last_project.json` cache) and restore it on boot. Pair with a
+  recent-projects menu in the topbar for parity with every IDE.
+- **Severity.** Low. Pure friction, but a friction every run.
+
+### 9.4 Positive UX observations (worth keeping)
+
+- The **two-column dense layout** (Goal + Tasks narrow, Chat wide,
+  Debug collapsible) held up well at 1024×768. Nothing overlapped,
+  nothing had to be scrolled to be found.
+- The **topbar status badges** (`planner …` / `ollama …`) give
+  at-a-glance health without a dedicated "status" screen. Once F-1 is
+  fixed, these become strictly useful.
+- **Phase 4 task rows look right when they do render**: status icon +
+  short task name + `<1s` elapsed + `SKIPPED` chip on cancel. The
+  design is sound; the open problem (F-2) is about **when** they
+  appear, not what they look like.
+
+### 9.5 Net-net verdict on Scenario A
+
+- **Status.** Scenario A did **not** complete its golden path on
+  `llama3.2:1b`. HELLO.md was never written; the executor never emitted
+  a `write_file` tool call.
+- **What we nonetheless proved.** Phase 2 (provider routing, badges),
+  Phase 4 (TaskPanel visual language once rendered) and Phase 5.2
+  (Debug pane virtualised timeline, ring buffer, Zustand store) are
+  all behaving as designed. The bottleneck is the **model**, not the
+  app's plumbing.
+- **What we disproved.** The unqualified claim that the system is
+  "coherent, understandable, and usable" in *every* Local
+  configuration. With a sub-3 B executor it is coherent (no crashes),
+  but not usable — there is no disk-side result to show for five
+  minutes of compute.
+- **Next validation step.** Re-run Scenario A with
+  `ollama_model = qwen2.5-coder:7b` (or `llama3.1:8b`) before
+  attempting Scenarios B/C/D/E. If the 7 B tier passes the golden
+  path, fixes F-1 / F-2 / F-3 / F-5 become the shortest path to a
+  trustworthy first-run experience on Local mode.
+
+### 9.6 Follow-up work opened by this session
+
+- [ ] **Fix F-1** — teach `check_planner` / `check_executor` /
+      `check_reviewer` to respect `ProviderMode` and route through
+      `resolve_provider`.
+- [ ] **Fix F-2** — emit a synthetic `planning` status from
+      `start_goal` so TaskPanel shows a live chip *before* any tasks
+      are parsed.
+- [ ] **Fix F-3** — progress bar colour + numerator should reflect
+      `done` only; cancelled/failed paint amber/red.
+- [ ] **Fix F-5** — force `streaming_role === "planner"` to tier
+      `thinking` in `classifyMessages`.
+- [ ] **Fix F-8** — persist last-opened project dir.
+- [ ] **Improve F-4** — surface a louder "unparsed executor output"
+      SystemAction and add a model-size warning in Settings.
+- [ ] **Retry Scenario A on `qwen2.5-coder:7b` or `llama3.1:8b`**
+      before moving on to Scenarios B–E.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
