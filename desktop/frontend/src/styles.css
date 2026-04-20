@@ -492,30 +492,138 @@ textarea:focus {
    awkwardly into the grid. Scenario-A §9.2 F-4. */
 .settings-small-model-warning {
   display: flex;
-  gap: 6px;
   align-items: flex-start;
-  margin-top: 4px;
-  padding: 6px 8px;
-  font-size: 12px;
-  line-height: 1.4;
-  color: #f9a825;
+  gap: 8px;
+  margin-top: 6px;
+  color: #d7b76a;
   background: rgba(249, 168, 37, 0.08);
-  border: 1px solid rgba(249, 168, 37, 0.35);
-  border-radius: 4px;
-}
-.settings-small-model-warning code {
-  font-family: var(--mono);
-  font-size: 11px;
-  background: rgba(249, 168, 37, 0.12);
-  padding: 0 3px;
-  border-radius: 2px;
+  border: 1px solid rgba(249, 168, 37, 0.22);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
 }
 
-.empty-state {
-  padding: 20px;
-  color: var(--fg-dim);
-  font-size: 12px;
-  text-align: center;
+.preset-input {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.preset-btn.ai-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(135deg, rgba(26, 26, 34, 0.92) 0%, rgba(18, 18, 26, 0.96) 100%);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: none;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.preset-btn.ai-pill:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.preset-btn.ai-pill.is-active {
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #fff;
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.08), 0 6px 18px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.preset-btn.ai-pill:focus-visible {
+  outline: 2px solid rgba(100, 160, 255, 0.8);
+  outline-offset: 2px;
+}
+
+.preset-btn.ai-pill.tone-openai {
+  border-color: rgba(0, 255, 157, 0.25);
+}
+
+.preset-btn.ai-pill.tone-openai:hover {
+  box-shadow: 0 10px 26px rgba(0, 255, 157, 0.12), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-openai.is-active {
+  background: linear-gradient(135deg, rgba(0, 255, 157, 0.16) 0%, rgba(0, 140, 90, 0.22) 100%);
+  border-color: rgba(0, 255, 157, 0.42);
+  box-shadow: 0 0 20px rgba(0, 255, 157, 0.16), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-anthropic {
+  border-color: rgba(120, 170, 255, 0.26);
+}
+
+.preset-btn.ai-pill.tone-anthropic:hover {
+  box-shadow: 0 10px 26px rgba(120, 170, 255, 0.14), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-anthropic.is-active {
+  background: linear-gradient(135deg, rgba(120, 170, 255, 0.16) 0%, rgba(70, 110, 210, 0.22) 100%);
+  border-color: rgba(120, 170, 255, 0.44);
+  box-shadow: 0 0 20px rgba(120, 170, 255, 0.18), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-google {
+  border-color: rgba(255, 200, 60, 0.28);
+}
+
+.preset-btn.ai-pill.tone-google:hover {
+  box-shadow: 0 10px 26px rgba(255, 200, 60, 0.14), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-google.is-active {
+  background: linear-gradient(135deg, rgba(255, 200, 60, 0.14) 0%, rgba(180, 130, 0, 0.22) 100%);
+  border-color: rgba(255, 200, 60, 0.46);
+  box-shadow: 0 0 20px rgba(255, 200, 60, 0.16), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-meta {
+  border-color: rgba(190, 120, 255, 0.28);
+}
+
+.preset-btn.ai-pill.tone-meta:hover {
+  box-shadow: 0 10px 26px rgba(190, 120, 255, 0.14), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-meta.is-active {
+  background: linear-gradient(135deg, rgba(190, 120, 255, 0.15) 0%, rgba(120, 60, 220, 0.22) 100%);
+  border-color: rgba(190, 120, 255, 0.46);
+  box-shadow: 0 0 20px rgba(190, 120, 255, 0.16), 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.preset-btn.ai-pill.tone-ollama {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.preset-btn.ai-pill.tone-ollama.is-active {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.14) 100%);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.preset-btn.ai-pill.tone-default {
+  border-color: rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.74);
+}
+
+.preset-btn.ai-pill.tone-default.is-active {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.12) 100%);
+  border-color: rgba(255, 255, 255, 0.24);
 }
 
 /* ---------- Agent role chips ---------- */

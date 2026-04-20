@@ -261,6 +261,50 @@ in `main.tsx`. If you add a new typeface, re-evaluate whether the
 rendering still passes the `1` vs `l` visual-distinctness test Inter
 gives us through `cv01/cv02`.
 
+### Settings: model preset pills (local UX)
+
+The Settings modal (`desktop/frontend/src/components/Settings.tsx`) includes
+**modern AI-style preset pill buttons** under the provider + per-role model inputs.
+These are a convenience affordance so users can pick a **known-good
+tool-capable model** quickly, without typing model ids by hand.
+
+- **Design rule:** presets are **Strong-only** (no Medium/Weak). The system
+  relies on the Planner/Executor emitting structured tool calls; smaller or
+  cheaper models frequently fail the executor tool-call loop (Scenario-A
+  finding F-4).
+- **Provider defaults:**
+  - OpenRouter default supports `Auto` (sets `openrouter/auto`).
+  - Ollama default supports `Default` (sets the app default model).
+- **Per-role overrides:**
+  - Each role row includes a `Default` pill which clears the override
+    (`""`) so the role falls back to the provider default.
+- **Current OpenRouter presets (diverse providers):**
+  - GPT-4o (`openai/gpt-4o`)
+  - Claude Sonnet (`anthropic/claude-3.5-sonnet`)
+  - Gemini 2.0 (`google/gemini-2.0-flash-exp`)
+  - Llama 4 (`meta-llama/llama-4-scout-17b-16e-instruct`)
+- **Current Ollama presets (diverse strong models):**
+  - Qwen Coder (`qwen2.5-coder:7b`)
+  - DeepSeek Coder (`deepseek-coder:6.7b`)
+  - Llama 3.1 (`llama3.1:8b`)
+  - Mistral (`mistral:7b`)
+- **Where it applies:**
+  - Provider defaults: `settings.openrouter_model`, `settings.ollama_model`
+  - Per-role overrides: `planner_model`, `executor_model`, `reviewer_model`
+    (planner/reviewer use OpenRouter presets; executor uses Ollama presets).
+- **Styling:** the pills are styled in `desktop/frontend/src/styles.css` via
+  `.preset-btn.ai-pill` plus provider tones (`.tone-openai`, `.tone-anthropic`,
+  `.tone-google`, `.tone-meta`, `.tone-ollama`, `.tone-default`). Features
+  include gradient backgrounds, glow effects on hover/active, smooth
+  transitions, and compact typography.
+- **Catalog-backed correctness:** OpenRouter preset buttons are **resolved from
+  the user-visible OpenRouter model catalog** (`probe_openrouter` →
+  `/api/v1/models`) after running *Test OpenRouter connection*.
+  - Exact id match is preferred (stable known ids).
+  - When exact ids differ, a regex fallback is used (e.g. “any
+    `anthropic/*sonnet*`”) so the button still maps to an actually available
+    model in the user’s catalog.
+
 ### Accessibility
 
 - Semantic `<header role="banner">` topbar, `<section aria-label>`

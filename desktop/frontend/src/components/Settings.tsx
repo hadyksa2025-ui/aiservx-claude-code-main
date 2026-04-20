@@ -2,6 +2,124 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { Settings } from "../types";
 
+type ModelPreset = {
+  label: string;
+  value: string;
+  tone: "openai" | "anthropic" | "google" | "meta" | "ollama" | "default";
+};
+
+type OpenRouterPresetCandidate = {
+  label: string;
+  tone: Extract<ModelPreset["tone"], "openai" | "anthropic" | "google" | "meta">;
+  candidates: string[];
+  fallback: RegExp[];
+};
+
+const OPENROUTER_PRESET_CANDIDATES: OpenRouterPresetCandidate[] = [
+  {
+    label: "GPT-4o",
+    tone: "openai",
+    candidates: [
+      "openai/gpt-4o",
+      "openai/gpt-4.1",
+      "openai/gpt-4-turbo",
+      "openai/gpt-4",
+    ],
+    fallback: [/^openai\/gpt-4o/i, /^openai\/gpt-4\./i, /^openai\/gpt-4/i],
+  },
+  {
+    label: "Claude Sonnet",
+    tone: "anthropic",
+    candidates: [
+      "anthropic/claude-3.5-sonnet",
+      "anthropic/claude-3.7-sonnet",
+      "anthropic/claude-3-opus",
+      "anthropic/claude-3-sonnet",
+    ],
+    fallback: [/^anthropic\/.*sonnet/i, /^anthropic\/claude-3/i],
+  },
+  {
+    label: "Gemini",
+    tone: "google",
+    candidates: [
+      "google/gemini-2.0-flash-exp",
+      "google/gemini-2.0-flash",
+      "google/gemini-1.5-pro",
+      "google/gemini-1.5-flash",
+    ],
+    fallback: [/^google\/gemini-2\./i, /^google\/gemini/i],
+  },
+  {
+    label: "Llama",
+    tone: "meta",
+    candidates: [
+      "meta-llama/llama-4-scout-17b-16e-instruct",
+      "meta-llama/llama-4-maverick-17b-128e-instruct",
+      "meta-llama/llama-3.1-70b-instruct",
+      "meta-llama/llama-3.1-405b-instruct",
+    ],
+    fallback: [/^meta-llama\/llama-4/i, /^meta-llama\/llama/i],
+  },
+];
+
+const OPENROUTER_PRESETS_FALLBACK: ModelPreset[] = [
+  { label: "GPT-4o", value: "openai/gpt-4o", tone: "openai" },
+  { label: "Claude Sonnet", value: "anthropic/claude-3.5-sonnet", tone: "anthropic" },
+  { label: "Gemini", value: "google/gemini-2.0-flash-exp", tone: "google" },
+  {
+    label: "Llama",
+    value: "meta-llama/llama-4-scout-17b-16e-instruct",
+    tone: "meta",
+  },
+];
+
+const OLLAMA_PRESETS: ModelPreset[] = [
+  { label: "Qwen Coder", value: "qwen2.5-coder:7b", tone: "ollama" },
+  { label: "DeepSeek Coder", value: "deepseek-coder:6.7b", tone: "ollama" },
+  { label: "Llama 3.1", value: "llama3.1:8b", tone: "ollama" },
+  { label: "Mistral", value: "mistral:7b", tone: "ollama" },
+];
+
+function PresetButtons({
+  value,
+  presets,
+  onPick,
+  defaultLabel,
+  defaultValue,
+}: {
+  value: string;
+  presets: ModelPreset[];
+  onPick: (next: string) => void;
+  defaultLabel?: string;
+  defaultValue?: string;
+}) {
+  return (
+    <div className="preset-row" role="group" aria-label="Model presets">
+      {defaultValue !== undefined && (
+        <button
+          type="button"
+          className={`preset-btn ai-pill tone-default ${value === defaultValue ? "is-active" : ""}`}
+          onClick={() => onPick(defaultValue)}
+          title={defaultValue === "" ? "Use provider default" : defaultValue}
+        >
+          {defaultLabel ?? "Default"}
+        </button>
+      )}
+      {presets.map((p) => (
+        <button
+          key={p.value}
+          type="button"
+          className={`preset-btn ai-pill tone-${p.tone} ${value === p.value ? "is-active" : ""}`}
+          onClick={() => onPick(p.value)}
+          title={p.value}
+        >
+          {p.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /**
  * Heuristic: does the model name look like a ≤3B parameter model?
  *
@@ -94,6 +212,32 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [orProbe, setOrProbe] = useState<OpenRouterProbeState>({
     kind: "idle",
   });
+  const [openRouterCatalog, setOpenRouterCatalog] = useState<string[] | null>(
+    null,
+  );
+
+  const resolveOpenRouterPresets = (catalog: string[] | null): ModelPreset[] => {
+    if (!catalog || catalog.length === 0) return OPENROUTER_PRESETS_FALLBACK;
+    const have = new Set(catalog);
+
+    const findRegexMatch = (patterns: RegExp[]): string | undefined => {
+      for (const re of patterns) {
+        const hit = catalog.find((id) => re.test(id));
+        if (hit) return hit;
+      }
+      return undefined;
+    };
+
+    const resolved: ModelPreset[] = [];
+    for (const p of OPENROUTER_PRESET_CANDIDATES) {
+      const pick = p.candidates.find((c) => have.has(c));
+      const best = pick ?? findRegexMatch(p.fallback);
+      if (best) resolved.push({ label: p.label, value: best, tone: p.tone });
+    }
+    return resolved.length > 0 ? resolved : OPENROUTER_PRESETS_FALLBACK;
+  };
+
+  const openrouterPresets = resolveOpenRouterPresets(openRouterCatalog);
 
   const testOpenRouter = async () => {
     setOrProbe({ kind: "testing" });
@@ -109,12 +253,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         });
         return;
       }
+      setOpenRouterCatalog(r.available_models ?? []);
       setOrProbe({
         kind: "ok",
         key_valid: r.key_valid,
         model_available: r.model_available,
-        available_models: r.available_models,
         credits_remaining: r.credits_remaining,
+        available_models: r.available_models ?? [],
       });
     } catch (e) {
       setOrProbe({ kind: "err", message: String(e) });
@@ -271,6 +416,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             value={s.openrouter_model}
             onChange={(e) => setS({ ...s, openrouter_model: e.target.value })}
           />
+          <PresetButtons
+            value={s.openrouter_model}
+            presets={openrouterPresets}
+            defaultLabel="Auto"
+            defaultValue={DEFAULTS.openrouter_model}
+            onPick={(next) => setS({ ...s, openrouter_model: next })}
+          />
         </div>
 
         <div className="row">
@@ -327,11 +479,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             }}
           >
             <span style={{ fontSize: 12, color: "#bbb" }}>Planner</span>
-            <input
-              placeholder="e.g. anthropic/claude-3.5-sonnet"
-              value={s.planner_model}
-              onChange={(e) => setS({ ...s, planner_model: e.target.value })}
-            />
+            <div className="preset-input">
+              <input
+                placeholder="e.g. anthropic/claude-3.5-sonnet"
+                value={s.planner_model}
+                onChange={(e) => setS({ ...s, planner_model: e.target.value })}
+              />
+              <PresetButtons
+                value={s.planner_model}
+                presets={openrouterPresets}
+                defaultLabel="Default"
+                defaultValue=""
+                onPick={(next) => setS({ ...s, planner_model: next })}
+              />
+            </div>
             {modelLooksSmall(s.planner_model) && (
               <>
                 <span />
@@ -339,11 +500,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </>
             )}
             <span style={{ fontSize: 12, color: "#bbb" }}>Executor</span>
-            <input
-              placeholder="e.g. deepseek-coder:6.7b"
-              value={s.executor_model}
-              onChange={(e) => setS({ ...s, executor_model: e.target.value })}
-            />
+            <div className="preset-input">
+              <input
+                placeholder="e.g. deepseek-coder:6.7b"
+                value={s.executor_model}
+                onChange={(e) => setS({ ...s, executor_model: e.target.value })}
+              />
+              <PresetButtons
+                value={s.executor_model}
+                presets={OLLAMA_PRESETS}
+                defaultLabel="Default"
+                defaultValue=""
+                onPick={(next) => setS({ ...s, executor_model: next })}
+              />
+            </div>
             {modelLooksSmall(s.executor_model) && (
               <>
                 <span />
@@ -351,11 +521,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </>
             )}
             <span style={{ fontSize: 12, color: "#bbb" }}>Reviewer</span>
-            <input
-              placeholder="e.g. anthropic/claude-3.5-sonnet"
-              value={s.reviewer_model}
-              onChange={(e) => setS({ ...s, reviewer_model: e.target.value })}
-            />
+            <div className="preset-input">
+              <input
+                placeholder="e.g. anthropic/claude-3.5-sonnet"
+                value={s.reviewer_model}
+                onChange={(e) => setS({ ...s, reviewer_model: e.target.value })}
+              />
+              <PresetButtons
+                value={s.reviewer_model}
+                presets={openrouterPresets}
+                defaultLabel="Default"
+                defaultValue=""
+                onPick={(next) => setS({ ...s, reviewer_model: next })}
+              />
+            </div>
           </div>
         </div>
 
@@ -371,6 +550,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <input
             value={s.ollama_model}
             onChange={(e) => setS({ ...s, ollama_model: e.target.value })}
+          />
+          <PresetButtons
+            value={s.ollama_model}
+            presets={OLLAMA_PRESETS}
+            defaultLabel="Default"
+            defaultValue={DEFAULTS.ollama_model}
+            onPick={(next) => setS({ ...s, ollama_model: next })}
           />
           {modelLooksSmall(s.ollama_model) && (
             <SmallModelWarning role="executor" />
