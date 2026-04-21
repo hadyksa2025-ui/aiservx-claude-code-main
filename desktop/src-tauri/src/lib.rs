@@ -21,6 +21,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod ai;
 mod cancel;
+mod codegen_envelope;
 mod controller;
 mod fs_ops;
 mod memory;
@@ -162,6 +163,7 @@ pub fn run() {
             memory::save_memory,
             controller::start_goal,
             controller::cancel_goal,
+            controller::run_codegen_envelope,
             project_scan::scan_project_cmd,
             tasks::load_task_tree,
             tasks::load_failures_log,

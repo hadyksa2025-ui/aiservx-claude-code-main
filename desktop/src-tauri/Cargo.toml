@@ -38,6 +38,10 @@ dirs = "5.0"
 uuid = { version = "1.10", features = ["v4"] }
 anyhow = "1.0"
 thiserror = "1.0"
+# JSON Schema validation for OC-Titan codegen envelope
+# (Phase 1.A, V6 §I.1 Deterministic Output Protocol). Pinned to 0.17
+# which supports Draft 2020-12 and compiles without native crypto deps.
+jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 
 # Subprocess-tree kill: on Unix we call `killpg(-pgid, SIGKILL)` through
 # libc. On Windows we shell out to `taskkill /T /F /PID <pid>`, so no

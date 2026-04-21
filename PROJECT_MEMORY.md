@@ -1343,5 +1343,107 @@ not an implementation detail.
 
 ---
 
+## 13. OC-Titan Phase 1.A — Codegen envelope (JSON schema enforcement)
+
+> **V6 Final Directive §I.1 (Deterministic Output Protocol).** Every
+> turn that generates project files must emit a single JSON envelope
+> that validates against the canonical schema *before* any file lands
+> on disk. No prose, no markdown fences, no free-text outside the
+> envelope. Phase 1.A is JSON enforcement only; the compiler gate
+> (`tsc --noEmit`) lands in Phase 1.B as PR-B.
+
+### Envelope shape
+
+Canonical schema lives at
+`desktop/src-tauri/src/schemas/codegen_envelope.json` (JSON Schema
+Draft 2020-12) and is embedded at compile time via `include_str!`. The
+shape:
+
+```json
+{
+  "files": [{ "path": "<sandbox-relative POSIX>", "content": "…" }],
+  "run_cmd": "<optional single line>"
+}
+```
+
+Hard invariants enforced by schema + Rust path check:
+
+- `files.minItems = 1`, `maxItems = 256`.
+- `path` has no leading `/`, no NUL, no `..` traversal, no Windows
+  drive letter (`C:\…`). Pattern check is first-line defence; Rust
+  `validate_path()` in `codegen_envelope.rs` is the fallback for
+  cases the regex can't express.
+- `content.maxLength = 4 MiB`, `run_cmd.maxLength = 2048`.
+- `additionalProperties = false` at every level.
+
+### `JsonMode` enum (`ai.rs`)
+
+Replaces the old `json_mode: bool` flag. Three-valued:
+
+| Variant             | When                               | Effect                                                                                     |
+| ------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------ |
+| `Off`               | Executor tool loops, reviewer      | Free-form prose + tool calls; tool schema is shipped with `tool_choice: "required"`.       |
+| `PlannerPlan`       | `controller::plan_goal`            | OpenRouter `response_format: json_object` / Ollama `format: json`; tool schema dropped.     |
+| `CodegenEnvelope`   | `ai::run_codegen_envelope_turn`    | Same JSON-mode wire flags as the planner, but parsed against `codegen_envelope.json`.       |
+
+`tool_choice: "required"` (upgrade from `"auto"`, per
+OPENROUTER_VALIDATION_REPORT §8.6) is only applied when the turn ships
+a tool schema AND `JsonMode` is `Off`. Pure-text reasoning turns carry
+no tool schema and therefore continue to use the model default.
+
+### Codegen turn flow
+
+1. `controller::run_codegen_envelope` (Tauri command) →
+   `ai::run_codegen_envelope_turn(app, state, project_dir, user_request, history, autonomous_confirm)`.
+2. The function frames the user request with `CODEGEN_ENVELOPE_PROMPT`
+   (see `ai.rs`) and invokes `run_chat_turn(..., JsonMode::CodegenEnvelope)`.
+3. The assistant text is fed through
+   `codegen_envelope::parse_and_validate`. On success the caller
+   receives a `CodegenEnvelopeTurn { envelope, raw, steps }`.
+4. On a `ParseError`, the turn re-prompts **once** (the `V6 §V.1`
+   JSON-repair loop; constant `CODEGEN_ENVELOPE_REPAIR_RETRIES = 1`)
+   using `ParseError::to_feedback()` — a bullet list with RFC 6901
+   JSON Pointers so the model can patch the exact failing field. A
+   second failure surfaces as an `envelope.violation` event and the
+   command returns `Err(..)`; there is no silent fallback.
+5. On success the caller hands the envelope to
+   `controller::apply_codegen_envelope`, which iterates files and
+   lands them through `fs_ops::write_file` (sandbox re-checks every
+   path). Each write emits a `codegen.envelope.write` step and the
+   final `codegen.envelope.applied` step carries file counts.
+
+### `ai:step` events (Terminal Authority, V6 §VI.1)
+
+All envelope-lifecycle transitions stream through the canonical
+`ai:step` channel so the Chat / TaskPanel / Debug tiers see them
+identically:
+
+| `label`                        | `status`  | Fields (selection)                      |
+| ------------------------------ | --------- | --------------------------------------- |
+| `codegen.envelope.request`     | `running` | —                                       |
+| `codegen.envelope.ok`          | `done`    | `files`, `repaired?`                    |
+| `codegen.envelope.violation`   | `failed`  | `feedback`, `attempt?`                  |
+| `codegen.envelope.retry`       | `running` | `attempt`                               |
+| `codegen.envelope.write`       | `done` / `failed` | `path`, `bytes`, `reason?`      |
+| `codegen.envelope.applied`     | `done` / `failed` | `files`, `failed`, `run_cmd`    |
+
+`run_cmd` is **captured and surfaced only** in Phase 1. Execution is
+deferred to Phase 2 behind the command-risk security gate (V6 §VII.2).
+
+### What is still TODO (intentionally deferred)
+
+- **Phase 1.B (PR-B):** `tsc --noEmit` compiler gate in
+  `<project>/.oc-titan/scratch/<uuid>/`, toolchain detection
+  (`bun x tsc` → `npx tsc` → global), retry budget
+  `MAX_COMPILE_RETRIES = 2`, promotion via `fs_ops::write_file` on
+  `CompileOk`, and new Settings toggles
+  (`compiler_gate_enabled`, `max_compile_retries`,
+  `tsc_timeout_secs`).
+- **Phase 1.C:** Dependency graph check — validate imports vs
+  `package.json` before the envelope is applied (V6 §I.6).
+- **Phase 2:** `run_cmd` auto-execution under the command-risk gate.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*

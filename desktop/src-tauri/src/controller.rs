@@ -22,6 +22,8 @@ use tokio::time::{sleep, timeout};
 use tracing::warn;
 
 use crate::ai::{self, UiMessage};
+use crate::codegen_envelope::{CodegenEnvelope, EnvelopeFile};
+use crate::fs_ops;
 use crate::project_scan;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
 use crate::AppState;
@@ -479,8 +481,8 @@ async fn execute_task_with_retries(
             Vec::<UiMessage>::new(),
             autonomous_confirm,
             // Autonomous tasks are free-form prose (and tool calls),
-            // not a JSON plan. `json_mode = false`.
-            false,
+            // not a JSON plan. `JsonMode::Off`.
+            ai::JsonMode::Off,
         );
         let turn = if task_timeout_secs > 0 {
             match timeout(Duration::from_secs(task_timeout_secs), fut).await {
@@ -752,7 +754,7 @@ async fn plan_goal(
         // model to a valid JSON object, dramatically reducing the
         // prose/markdown wrapping that small local models tend to
         // emit.
-        true,
+        ai::JsonMode::PlannerPlan,
     )
     .await?;
     let text = resp.assistant.trim().to_string();
@@ -762,6 +764,7 @@ async fn plan_goal(
 
     // JSON repair/retry: small local models frequently wrap JSON in prose
     // or markdown. Retry once with an explicit reprompt.
+    // `JSON_REPAIR_RETRIES = 1` (Phase 1.A).
     warn!("plan_goal: first attempt did not return valid JSON, retrying with reprompt");
     let reprompt = format!(
         "{full}\n\n\
@@ -779,7 +782,7 @@ async fn plan_goal(
         // Retry also in JSON mode — the retry reprompt is explicit
         // about wanting JSON, so enforcement at the API level still
         // helps.
-        true,
+        ai::JsonMode::PlannerPlan,
     )
     .await?;
     let retry_text = retry_resp.assistant.trim().to_string();
@@ -984,8 +987,8 @@ async fn review_task(
         Vec::<UiMessage>::new(),
         false,
         // Task reviewer output is "OK: …" / "NEEDS_FIX: …",
-        // never JSON. `json_mode = false`.
-        false,
+        // never JSON. `JsonMode::Off`.
+        ai::JsonMode::Off,
     )
     .await
     {
@@ -1086,4 +1089,136 @@ That should do it."#;
         assert!(extract_first_balanced_json("no braces here").is_none());
         assert!(extract_first_balanced_json("{unclosed").is_none());
     }
+}
+
+// ---------- Codegen envelope application (Phase 1.A J-7 / J-9) ----------
+
+/// Per-file result produced by [`apply_codegen_envelope`]. Mirrors the
+/// shape consumed by the UI's codegen panel: the path that was written
+/// (sandbox-relative, re-echoed from the envelope), the number of bytes
+/// written, and the unified diff against the previous contents so the
+/// reviewer UI can surface exactly what changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedFile {
+    pub path: String,
+    pub bytes: usize,
+    pub diff: String,
+}
+
+/// Outcome of applying a validated envelope to disk. `failed` is
+/// non-empty iff one or more files could not be written (e.g. sandbox
+/// resolve rejected a path). Callers should treat a non-empty `failed`
+/// as a hard failure — Phase 1.A does not partially commit.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedEnvelope {
+    pub applied: Vec<AppliedFile>,
+    pub failed: Vec<(String, String)>,
+    /// Captured but NEVER auto-executed in Phase 1 (user-confirmed
+    /// earlier: "parse + validate only, no execution, only surface as
+    /// metadata"). Phase 2 security gate will decide execution policy.
+    pub run_cmd: Option<String>,
+}
+
+/// Write every file in a validated [`CodegenEnvelope`] to disk through
+/// the sandbox (`fs_ops::write_file`), emitting `ai:step` telemetry for
+/// each file so the Terminal Authority view stays consistent (V6 §VI.1).
+///
+/// This function assumes the envelope has already passed
+/// `codegen_envelope::parse_and_validate` — it does not re-validate
+/// paths beyond the sandbox check. Any path rejected by
+/// `fs_ops::resolve` is recorded under `failed` with the reason.
+pub fn apply_codegen_envelope(
+    app: &AppHandle,
+    project_dir: &str,
+    envelope: &CodegenEnvelope,
+) -> AppliedEnvelope {
+    let mut applied: Vec<AppliedFile> = Vec::with_capacity(envelope.files.len());
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for EnvelopeFile { path, content } in &envelope.files {
+        match fs_ops::write_file(
+            project_dir.to_string(),
+            path.clone(),
+            content.clone(),
+        ) {
+            Ok(diff) => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "executor",
+                        "label": "codegen.envelope.write",
+                        "status": "done",
+                        "path": path,
+                        "bytes": content.len(),
+                    }),
+                );
+                applied.push(AppliedFile {
+                    path: path.clone(),
+                    bytes: content.len(),
+                    diff,
+                });
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "executor",
+                        "label": "codegen.envelope.write",
+                        "status": "failed",
+                        "path": path,
+                        "reason": e,
+                    }),
+                );
+                failed.push((path.clone(), e));
+            }
+        }
+    }
+
+    let status = if failed.is_empty() { "done" } else { "failed" };
+    let _ = app.emit(
+        "ai:step",
+        json!({
+            "role": "executor",
+            "label": "codegen.envelope.applied",
+            "status": status,
+            "files": applied.len(),
+            "failed": failed.len(),
+            "run_cmd": envelope.run_cmd,
+        }),
+    );
+
+    AppliedEnvelope {
+        applied,
+        failed,
+        run_cmd: envelope.run_cmd.clone(),
+    }
+}
+
+/// Tauri command: run a single codegen envelope turn end-to-end and, on
+/// success, land files into the project sandbox. The JSON-schema /
+/// retry path is owned by [`ai::run_codegen_envelope_turn`]; this
+/// command is the thin wire-level entrypoint the UI binds to.
+///
+/// Phase 1 surfaces `run_cmd` on the returned payload but does NOT
+/// execute it — that is deferred to Phase 2 behind the command-risk
+/// security gate.
+#[tauri::command]
+pub async fn run_codegen_envelope(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_dir: String,
+    user_request: String,
+    history: Vec<UiMessage>,
+    autonomous_confirm: bool,
+) -> Result<AppliedEnvelope, String> {
+    let turn = ai::run_codegen_envelope_turn(
+        app.clone(),
+        state.inner(),
+        project_dir.clone(),
+        user_request,
+        history,
+        autonomous_confirm,
+    )
+    .await?;
+    Ok(apply_codegen_envelope(&app, &project_dir, &turn.envelope))
 }
