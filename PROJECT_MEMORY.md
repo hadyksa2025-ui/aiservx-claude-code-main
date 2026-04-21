@@ -2139,6 +2139,94 @@ Registered in `lib.rs` alongside `run_codegen_envelope`. Useful for:
 Full suite: **121/121** passing (104 pre-existing + 17 new).
 `cargo check` clean.
 
+### §16.10.1 PR-G hotfix — two dangerous-pattern gaps
+
+Devin Review on the merged PR-F (#6) surfaced two functional gaps
+in `match_dangerous`. PR-G fixes both with targeted rules and
+regression tests; the rest of Phase 2.A is unchanged.
+
+**BUG-G1 — `git push -f` trailing-space bypass** (comment
+`BUG_pr-review-job-...-0001`). The substring `"git push -f "` in
+the dangerous needle list required a trailing space, so the bare
+command `git push -f` (end of string, no further args) fell
+through to the generic `warning.git_write` regex and classified
+as Warning instead of Dangerous. `git push -f` is a real force
+push that rewrites the upstream just like `git push -f origin
+main`. Fix: replace the brittle substring with a `Lazy<Regex>`
+`\bgit\s+push\s+-f\b` evaluated after the substring loop. The
+word boundary matches end-of-string, whitespace, and punctuation
+after `-f`, while rejecting hypothetical typos like `git push
+-foo` where the next char is still a word char.
+
+**BUG-G2 — missing `fork()` pattern** (comment
+`BUG_pr-review-job-...-0002`). The docstring above
+`match_dangerous` promised full parity with
+`crate::tools::deny_reason`, but `deny_reason` included
+`("fork()", "fork bomb variant")` at `tools.rs:494` while the
+classifier did not. Phase 2.B's migration off `deny_reason`
+would have silently demoted `fork()` from blocked → Warning.
+Fix: add `("fork()", "dangerous.fork_bomb_variant", "fork bomb
+variant")` to the substring needle list so lowercased input
+containing `fork()` matches directly.
+
+**BUG-G3 — `--force-with-lease` telemetry shadowed by `--force`**
+(follow-up review comment on PR-G itself). `"git push --force"`
+is a substring of `"git push --force-with-lease"`, and the former
+was listed first in the dangerous needle table, so the latter
+always attributed `matched_rule = dangerous.force_push` instead
+of `dangerous.force_push_lease`. Security tier (Dangerous) was
+correct either way, but telemetry fidelity matters for UI reason
+text and Phase 2.B audit trails. Fix: swap the two lines so the
+more-specific needle is checked first, with an inline comment
+explaining why these two are the exception to the "order does
+not matter" guidance at the top of the table.
+
+**Regression coverage.**
+- `bare_git_push_f_classifies_as_dangerous` — five variants
+  including bare, padded, extra-whitespace, with upstream args,
+  and uppercase.
+- `git_push_f_word_boundary_rejects_typos` — `git push -foo`
+  must not match `dangerous.force_push`.
+- `fork_variant_classifies_as_dangerous` — `fork()` alone,
+  wrapped in `bash -c '...'`, and uppercase.
+- `force_with_lease_attributes_to_lease_rule` — three variants
+  ensuring `matched_rule = dangerous.force_push_lease`.
+- Three new entries in `dangerous_matrix_blocks` keep the
+  existing matrix honest (`git push -f`, `git push -f` with
+  padding, `git  push  -f` with extra internal whitespace,
+  `fork()`, `bash -c 'fork()'`).
+
+All 125 lib tests pass (`cargo test --lib`: 121 previous +
+4 new regression).
+
+### §16.10.2 Deferred informational findings from PR-F review
+
+- **Case-sensitivity asymmetry** (comment `ANALYSIS_...-0001`).
+  `match_dangerous` lowercases input; `match_warning` /
+  `match_safe` do not. Mixed-case `NPM INSTALL` or `CARGO CHECK`
+  falls through to `unknown` → Warning, same tier as the
+  lowercase variants would produce, but with `matched_rule =
+  unknown` instead of `warning.npm_install` / `safe.cargo_check`.
+  Security classification is unaffected (safe-direction fall-
+  through); only telemetry fidelity. Left as-is; a future refactor
+  that normalizes input before all three matchers would close
+  the gap without changing outcomes.
+- **`rm -rf /tmp/foo` over-classification** (comment
+  `ANALYSIS_...-0002`). The `lower.contains("rm -rf /")` check
+  matches any `rm -rf` followed by any absolute path, so
+  `rm -rf /tmp/build-cache` classifies as
+  `dangerous.rm_rf_root`. Safe-direction; acceptable trade-off
+  vs. risk of missing `rm -rf /;` / `rm -rf /&`.
+- **`cargo fmt src/lib.rs` telemetry drop** (comment
+  `ANALYSIS_...-0003`). Warning via fallback rather than via
+  `warning.cargo_fmt`; classification tier is unchanged, only
+  `matched_rule` differs.
+- **Compound detector discussion** (comment `ANALYSIS_...-0004`).
+  Reviewer confirms `$HOME` correctly does NOT trigger compound
+  escalation (only `$(` does). No change.
+- **`tsc --noEmit` regex style** (comment `ANALYSIS_...-0005`).
+  Backtracking note, not a correctness issue. No change.
+
 ### §16.10 Out of scope (intentionally deferred)
 
 - **Execution of `run_cmd`.** Phase 2.B. The classifier is the
