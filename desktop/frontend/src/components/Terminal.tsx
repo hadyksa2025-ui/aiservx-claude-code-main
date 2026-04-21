@@ -4,6 +4,7 @@ import { api, onEvent } from "../api";
 interface TerminalProps {
   projectDir: string | null;
   terminalId: string;
+  onRunningChange?: (running: boolean) => void;
 }
 
 interface OutputLine {
@@ -12,7 +13,7 @@ interface OutputLine {
   stream: "stdout" | "stderr";
 }
 
-export function Terminal({ projectDir, terminalId }: TerminalProps) {
+export function Terminal({ projectDir, terminalId, onRunningChange }: TerminalProps) {
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
@@ -21,6 +22,10 @@ export function Terminal({ projectDir, terminalId }: TerminalProps) {
   const outputRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const lineIdRef = useRef(0);
+
+  useEffect(() => {
+    onRunningChange?.(running);
+  }, [running, onRunningChange]);
 
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [];
@@ -66,7 +71,13 @@ export function Terminal({ projectDir, terminalId }: TerminalProps) {
     if (!projectDir || !cmd.trim()) return;
 
     setRunning(true);
-    setHistory((prev) => [...prev, cmd]);
+    setHistory((prev) => {
+      const next = [...prev, cmd];
+      if (next.length > 100) {
+        return next.slice(-100);
+      }
+      return next;
+    });
     setHistoryIndex(-1);
     setInput("");
 

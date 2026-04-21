@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Terminal } from "./Terminal";
+import { api } from "../api";
 
 type TerminalTab = {
   id: string;
@@ -18,13 +19,27 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
     { id: newTerminalId(), title: "Terminal 1" },
   ]);
   const [activeId, setActiveId] = useState(() => tabs[0]!.id);
+  const [runningTerminals, setRunningTerminals] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    // Kill all running terminals when project changes
+    const killAllRunning = async () => {
+      for (const terminalId of runningTerminals) {
+        try {
+          await api.terminalKill(terminalId);
+        } catch {
+          // Ignore - process may have already ended
+        }
+      }
+      setRunningTerminals(new Set());
+    };
+    killAllRunning();
+
     // New project == new terminal sessions (avoid cross-project mixing).
     const id = newTerminalId();
     setTabs([{ id, title: "Terminal 1" }]);
     setActiveId(id);
-  }, [projectDir]);
+  }, [projectDir, runningTerminals]);
 
   useEffect(() => {
     // Keep activeId valid after resets.
@@ -46,12 +61,31 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
     });
   }, []);
 
-  const closeTab = useCallback((id: string) => {
+  const handleRunningChange = useCallback((terminalId: string, running: boolean) => {
+    setRunningTerminals((prev) => {
+      const next = new Set(prev);
+      if (running) {
+        next.add(terminalId);
+      } else {
+        next.delete(terminalId);
+      }
+      return next;
+    });
+  }, []);
+
+  const closeTab = useCallback(async (id: string) => {
+    if (runningTerminals.has(id)) {
+      try {
+        await api.terminalKill(id);
+      } catch {
+        // Ignore kill errors - process may have already ended
+      }
+    }
     setTabs((prev) => {
       if (prev.length <= 1) return prev;
       return prev.filter((t) => t.id !== id);
     });
-  }, []);
+  }, [runningTerminals]);
 
   return (
     <div className="terminal-manager">
@@ -99,7 +133,11 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
       </div>
 
       <div className="terminal-manager-body">
-        <Terminal projectDir={projectDir} terminalId={active.id} />
+        <Terminal 
+          projectDir={projectDir} 
+          terminalId={active.id} 
+          onRunningChange={(running) => handleRunningChange(active.id, running)}
+        />
       </div>
     </div>
   );

@@ -521,6 +521,10 @@ pub async fn run_cmd_stream(
     cmd: String,
     timeout_ms: Option<u64>,
 ) -> Result<RunCmdResult, String> {
+    if terminal_id.is_empty() {
+        return Err("terminal_id cannot be empty".to_string());
+    }
+
     let root = std::path::Path::new(&project_dir)
         .canonicalize()
         .map_err(|e| format!("invalid project root: {e}"))?;
@@ -640,9 +644,14 @@ pub async fn terminal_kill(
     state: tauri::State<'_, AppState>,
     terminal_id: String,
 ) -> Result<(), String> {
+    if terminal_id.is_empty() {
+        return Err("terminal_id cannot be empty".to_string());
+    }
+
+    // Get PID but keep it in the map until kill completes to avoid race condition
     let pid = {
-        let mut map = state.terminal_pids.lock().await;
-        map.remove(&terminal_id)
+        let map = state.terminal_pids.lock().await;
+        map.get(&terminal_id).copied()
     };
 
     let Some(pid) = pid else {
@@ -652,23 +661,43 @@ pub async fn terminal_kill(
     #[cfg(windows)]
     {
         // `taskkill /T /F` = kill process tree.
-        let _ = tokio::process::Command::new("taskkill")
+        let result = tokio::process::Command::new("taskkill")
             .arg("/T")
             .arg("/F")
             .arg("/PID")
             .arg(pid.to_string())
             .status()
             .await;
+
+        // Remove from map after kill attempt (success or failure)
+        {
+            let mut map = state.terminal_pids.lock().await;
+            map.remove(&terminal_id);
+        }
+
+        if let Err(e) = result {
+            tracing::warn!("Failed to kill terminal {} (PID {}): {}", terminal_id, pid, e);
+        }
         return Ok(());
     }
 
     #[cfg(unix)]
     {
-        let _ = tokio::process::Command::new("kill")
+        let result = tokio::process::Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
             .status()
             .await;
+
+        // Remove from map after kill attempt
+        {
+            let mut map = state.terminal_pids.lock().await;
+            map.remove(&terminal_id);
+        }
+
+        if let Err(e) = result {
+            tracing::warn!("Failed to kill terminal {} (PID {}): {}", terminal_id, pid, e);
+        }
         return Ok(());
     }
 }
