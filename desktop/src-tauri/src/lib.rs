@@ -22,6 +22,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod ai;
 mod cancel;
 mod codegen_envelope;
+mod compiler_gate;
 mod controller;
 mod fs_ops;
 mod memory;
