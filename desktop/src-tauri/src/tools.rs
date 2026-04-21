@@ -779,7 +779,14 @@ pub async fn confirm_cmd(
     }
 }
 
-async fn run_cmd_impl(
+/// Shared process-spawning implementation used by the legacy AI tool
+/// loop (`execute_run_cmd_gated` / `run_cmd` / `run_cmd_stream`) and,
+/// since Phase 2.B, by [`crate::run_cmd_gate::execute_run_cmd`]. The
+/// function is crate-visible because the Phase 2.B gate wraps it with
+/// classifier-driven policy decisions but reuses the same
+/// cancel-aware, tree-killing, pipe-teeing implementation rather than
+/// duplicating it.
+pub(crate) async fn run_cmd_impl(
     project_dir: &str,
     cmd: &str,
     timeout_ms: u64,

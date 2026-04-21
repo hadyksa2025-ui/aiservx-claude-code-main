@@ -2244,5 +2244,207 @@ All 125 lib tests pass (`cargo test --lib`: 121 previous +
 
 ---
 
+## §17. OC-Titan Phase 2.B — `run_cmd` execution engine (V6 §VII.2 + §V.3 hook)
+
+Phase 2.B (PR-H) wires the Phase 2.A classifier
+(`security_gate::classify`, §16) into **actual `run_cmd` execution**
+through the existing in-production `tools::run_cmd_impl`. No new
+execution engine is introduced; the gate is a thin policy +
+telemetry wrapper around the same child-spawn / cancel / tree-kill
+machinery the legacy tool loop already uses.
+
+### §17.1 Module map (new file)
+
+- `desktop/src-tauri/src/run_cmd_gate.rs`
+  - `Decision { AutoRun | Prompt | Block }` — three-way policy
+    verdict, emitted on every decision via `run_cmd.policy`.
+  - `ExecutionStatus { Executed | RefusedDangerous | BlockedByPolicy |
+    UserDenied | ConfirmTimedOut | Skipped }` — terminal state of
+    every `execute_run_cmd` call. `event_status()` maps each to the
+    `ai:step` `status` tag.
+  - `ExecutionResult` — `{ exit_code, duration_ms, stdout_tail,
+    stderr_tail, classification, decision, status, reason }`;
+    serialised into the envelope return and consumed by §V.3 runtime
+    validation (next phase).
+  - `PolicyInputs<'a>` — `{ class, warning_mode, dangerous_policy,
+    autonomous_confirm, allow_list_match }`.
+  - `decide(&PolicyInputs) -> Decision` — pure function; covered by
+    17 deterministic truth-table tests.
+  - `allow_list_matches(cmd, &[String]) -> bool` — exact-or-prefix
+    match, ignoring empty entries (whitespace-only lines survive
+    `settings.rs` load without silently allow-listing everything).
+  - `tail_for_log(&str) -> String` — UTF-8-safe char-bounded tail
+    (mirrors `controller::truncate_for_log`; never byte-slices).
+  - `execute_run_cmd(app, state, project_dir, cmd, cancel) ->
+    Result<ExecutionResult, String>` — main entrypoint (envelope
+    controller + Tauri command both call it).
+  - `execute_classified_run_cmd` (Tauri `#[command]`) — standalone
+    surface for the future §VI.2/§VI.3 UI panel. Reads `AppState`
+    from the `tauri::State` and forwards.
+
+### §17.2 Decision matrix (policy truth table)
+
+| class     | warning_mode | dangerous_policy | autonomous_confirm | allow_list match | Decision                       |
+|-----------|--------------|------------------|--------------------|------------------|--------------------------------|
+| Safe      | any          | any              | false              | any              | AutoRun                        |
+| Safe      | any          | any              | true               | any              | Prompt                         |
+| Warning   | "allow"      | any              | false              | any              | AutoRun                        |
+| Warning   | "allow"      | any              | true               | any              | Prompt (autonomous upgrade)    |
+| Warning   | "prompt"     | any              | any                | miss             | Prompt                         |
+| Warning   | "prompt"     | any              | false              | match            | AutoRun (allow-list downgrade) |
+| Warning   | "prompt"     | any              | true               | match            | Prompt (autonomous wins)       |
+| Warning   | "block"      | any              | any                | any              | Block                          |
+| Dangerous | any          | "refuse"         | any                | any              | Block                          |
+| Dangerous | any          | "prompt"         | any                | any              | Prompt                         |
+| Dangerous | any          | unknown          | any                | any              | Block (fail-closed default)    |
+
+Notes:
+- **Allow-list never overrides `warning_mode = "block"`** — block is
+  administrative, allow-list is user convenience; a bug here would
+  silently defeat an explicit opt-out.
+- **Allow-list never applies to Dangerous** — by construction; the
+  classifier only produces Dangerous for irreversible / credential
+  / injection patterns.
+- **Unknown `warning_mode` / `dangerous_policy` → safest default
+  (Prompt / Block)** with two regression tests.
+
+### §17.3 Lifecycle inside `run_codegen_envelope`
+
+```
+  … envelope parsed & validated (§13)
+  → dependency guard (§15) passes / reprompts
+  → compiler gate (§14) passes / reprompts
+  → apply_codegen_envelope writes files through sandbox
+  → security_gate::classify(run_cmd) emits `security.classified`
+  → if settings.security_gate_execute_enabled:
+       run_cmd_gate::execute_run_cmd
+         • computes Decision via decide()
+         • emits `run_cmd.policy` (always)
+         • Block → emit refused/blocked → return Skipped-shaped result
+         • Prompt → await_user_confirmation
+             - Approve → proceed to spawn
+             - Deny → emit `run_cmd.user_denied` → UserDenied
+             - TimedOut/Cancelled → ConfirmTimedOut
+         • AutoRun (or post-approve) →
+             - emit `run_cmd.started`
+             - tools::run_cmd_impl (shared with legacy tool loop;
+               cancel-aware, tree-killing, pipe-teed)
+             - emit `run_cmd.completed` (exit_code, duration_ms, tails)
+         • ExecutionResult written onto AppliedEnvelope.execution
+     else:
+       Phase 1 behaviour preserved — run_cmd surfaces as metadata.
+```
+
+Back-compat: `security_gate_execute_enabled = false` by default, so
+every existing code path (including the legacy `execute_run_cmd_gated`
+tool loop) is byte-identical to pre-2.B. The opt-in flips when the
+§VI.2/§VI.3 UI panel lands.
+
+### §17.4 New `ai:step` events (role = `"execution"`)
+
+All emitted through the existing `ai:step` channel (UI-agnostic):
+
+- `run_cmd.policy` — always emitted before any side effect. Payload:
+  `{ decision, class, warning_mode, dangerous_policy, allow_list_matched,
+     autonomous_confirm, cmd }`.
+- `run_cmd.confirmation` — only emitted when `Decision::Prompt`;
+  payload carries `{ cmd, class, matched_rule, reason }` so UI can
+  render a justification next to the confirm dialog.
+- `run_cmd.started` — right before `run_cmd_impl` spawn;
+  `{ cmd, timeout_ms, class }`.
+- `run_cmd.completed` — after child is reaped;
+  `{ exit_code, duration_ms, stdout_tail, stderr_tail, class }`.
+- `run_cmd.refused` — Dangerous → Block path;
+  `{ reason, class, matched_rule }`.
+- `run_cmd.blocked` — Warning → Block path (warning_mode="block");
+  same shape as refused with `class: "warning"`.
+- `run_cmd.user_denied` — confirm modal Deny; `{ cmd }`.
+- `run_cmd.error` — infra-level failure (invalid project root,
+  spawn error). Envelope still commits successfully; user can retry
+  from the terminal panel.
+
+`terminal:output` + `terminal:done` continue to be emitted by
+`run_cmd_impl` itself — no duplication in the gate.
+
+### §17.5 Settings (three new fields, all `#[serde(default)]`)
+
+- `security_gate_execute_enabled: bool` — **default `false`**.
+  Opt-in until UI §VI.2/§VI.3 lands. When off, everything else in
+  §17 is inert.
+- `security_gate_execute_timeout_ms: u64` — default `120_000` (2
+  min). Wall-clock for a single `run_cmd`; `tools::run_cmd_impl`
+  enforces via SIGKILL / TerminateJobObject.
+- `security_gate_dangerous_policy: String` — default `"refuse"`;
+  `"prompt"` routes Dangerous through the same confirm modal as
+  Warning (explicit escape hatch for power users).
+
+All three fields are forward-compatible with Phase 1 settings files
+(missing keys parse via `default` fns and `#[serde(default)]`).
+
+### §17.6 Execution path reuses `tools::run_cmd_impl`
+
+`tools::run_cmd_impl` (visibility changed from private to
+`pub(crate)` in this PR) is the in-production runner shared with
+`execute_run_cmd_gated` / `run_cmd_stream`. It already handles:
+
+- concurrent stdout/stderr reading + `terminal:output` streaming
+- `CancelToken` polling via `tokio::select!` with tree-kill on
+  cancel / timeout (PR-C hardening from §14.1)
+- per-process timeout that kills before `wait_with_output` (prevents
+  the pipe-buffer deadlock fixed in PR-C)
+- exit-code capture and a 4 KB char-bounded tail (UTF-8-safe)
+
+Reusing this function eliminates the risk of introducing a
+parallel execution engine that lacks one of those hardenings.
+
+### §17.7 Tauri surface
+
+- `execute_classified_run_cmd(app, project_dir, cmd)` registered in
+  `lib.rs` alongside the Phase 2.A `classify_run_cmd`. The UI can
+  call it directly (with a pre-shown classification) once §VI.2 /
+  §VI.3 land; it does not depend on the envelope controller.
+
+### §17.8 Tests (`cargo test --lib run_cmd_gate`, 23 new)
+
+- **Decision matrix (17)** — every non-trivial row of §17.2, plus
+  the four "unknown setting → safe default" rows.
+- **Allow-list (2)** — exact + prefix match; empty entries ignored.
+- **Tail UTF-8 (2)** — short strings untouched; 4-byte emoji at the
+  4096-char boundary never panics.
+- **Execution surface (3)**:
+  - `execute_empty_cmd_returns_skipped` — whitespace short-circuit.
+  - `execute_dangerous_refuses_without_spawn` — no child, status =
+    `RefusedDangerous`, reason starts with `"refused: "`.
+  - `execute_warning_prompt_without_ui_returns_user_denied` — no
+    AppHandle means no modal; the gate cannot silently auto-run.
+- **Real spawn (1)**:
+  - `execute_safe_echo_runs_and_captures_exit_0` — `echo
+    hello_from_gate` classified Safe → AutoRun → `run_cmd_impl` →
+    `Executed`, `exit_code = 0`, `stdout_tail` contains the token.
+    Proves the end-to-end wire-up actually spawns and captures
+    output.
+
+Total lib-test count after PR-H: **148 green** (Phase 1 + 2.A + new).
+
+### §17.9 Deliberately deferred (not in PR-H)
+
+- **Legacy `tools::execute_run_cmd_gated` migration.** Still valid
+  as a shim; migrating it onto `run_cmd_gate::execute_run_cmd`
+  would widen PR-H beyond the execution-engine introduction. A
+  follow-up PR will port it (same classifier, same policy, same
+  tests) with no API break.
+- **§V.3 runtime validation.** Consumes `ExecutionResult.exit_code`
+  + `stderr_tail` to drive a reprompt loop when a user-approved
+  `run_cmd` exits non-zero. Added in the next phase.
+- **§VI.2 / §VI.3 UI tiers.** Event payloads are already shaped for
+  the 3-tier layout (ThinkingBlock / FinalAnswer / SystemAction);
+  binding them into the React store is a frontend PR.
+- **Phase 2.C auto-install.** Depends on 2.B merging first; will
+  synthesize `bun add <missing>` / `npm install <missing>` from
+  `dependency_guard`'s miss list (§15) and route through
+  `execute_run_cmd` like any other command.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
