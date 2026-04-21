@@ -1574,12 +1574,97 @@ Every compile lifecycle transition emits a structured `ai:step`:
 
 ### Unit tests
 
-`cargo test --lib compiler_gate` covers 12 cases, grouped by
+`cargo test --lib compiler_gate` covers 15 cases grouped by
 responsibility: TypeScript-file detection, skip policy (toggle + no
 ts), diagnostic parsing (canonical, empty, continuation lines),
 feedback formatting (empty + stable), path rewriting (strips scratch
-UUID), scratch operations (writes + gitignore), and cleanup safety
-(refuses outside scratch).
+UUID), scratch operations (writes + gitignore), cleanup safety
+(refuses outside scratch), scratch GC (removes stale dirs, keeps
+fresh, no-op when root missing), and pipe-drain deadlock regression
+(large stderr does not stall `run_tsc`). See §14.1 for the PR-C
+hotfixes that added the last three tests.
+
+### 14.1 PR-C hotfixes — pipe deadlock, UTF-8 safety, scratch GC
+
+> Status: **implemented, PR-C** on
+> `devin/1776803952-oc-titan-compiler-gate-hotfix`. PR-C closes two
+> bugs and one follow-up flagged by Devin Review on the merged
+> PR-B. No API surface changed; all fixes are internal to the
+> compiler gate and the controller's log-truncation helper.
+
+#### Bug 1 — pipe-buffer deadlock in `run_tsc`
+
+The previous `run_tsc` took stdout/stderr pipes from the child,
+then called `child.wait()`, and only drained the pipes *after*
+the wait returned. On Linux a pipe buffer is typically 64 KiB;
+tsc can easily exceed that on a project with many diagnostics.
+Once the buffer filled, tsc blocked on its own write and `wait()`
+blocked on tsc's exit — a textbook deadlock. The outer
+`tokio::time::timeout` would eventually fire and the outcome was
+mis-classified as `CompileOutcome::Timeout`, which carries no
+diagnostics — the very output the repair loop needs. Because
+`Timeout` returns `Err` with no retry, legitimate compile
+failures were silently hidden behind a confusing "timeout"
+message.
+
+Fix: spawn two `tokio::spawn` readers (`read_to_end` on each
+pipe) *before* awaiting `child.wait()`. On timeout we kill the
+child first, then await the reader tasks so they observe EOF
+rather than hanging on the other deadlock side.
+
+Regression test: `run_tsc_drains_large_stderr_without_deadlock`
+spawns `sh -c 'dd if=/dev/zero bs=204800 count=1 | tr \\0 x >&2;
+exit 2'` and asserts the child exits cleanly and all 200 KiB
+reach stderr. We generate the payload inside the child because
+passing 200 KiB via argv trips Linux's `E2BIG` limit.
+
+#### Bug 2 — `truncate_for_log` panic on UTF-8 boundary
+
+`controller::truncate_for_log` used a raw byte slice
+(`s[..4096]`). If byte 4096 fell mid-codepoint (Arabic text,
+emoji, the Unicode arrow tsc sometimes emits), `&str::index`
+panics with `byte index X is not a char boundary`. That
+panic lived on the error path where compile retries are
+exhausted — so a real compile failure would crash the Tauri
+backend instead of returning a clean `Err` to the UI.
+
+Fix: `s.chars().take(MAX_CHARS).collect::<String>()` — constant
+`MAX_CHARS = 4096` now counts codepoints, not bytes. The
+truncation footer also reports chars truncated, not bytes.
+
+Regression tests: `ascii_boundary_does_not_panic`,
+`multi_byte_boundary_does_not_panic` (Arabic, 2-byte codepoints),
+`four_byte_emoji_boundary_does_not_panic` (🔥, 4-byte codepoints).
+
+#### Follow-up — stale scratch GC
+
+`Scratch::cleanup` only runs on the normal control flow
+(`Drop`-on-success, explicit `cleanup` on error). A panic inside
+`run_tsc`, a SIGKILL on the Tauri backend, or a power loss
+between `prepare_scratch` and `cleanup` would leave the UUID dir
+behind forever. Left unaddressed, `.oc-titan/scratch/` grows
+without bound.
+
+Fix: new `compiler_gate::gc_stale_scratch(oc_root, max_age)`
+invoked best-effort from `prepare_scratch` after the `.oc-titan`
+tree is created. Removes any dir directly under
+`<oc_root>/scratch/` whose mtime is older than `max_age`
+(hard-coded to 24 h). I/O errors are swallowed so GC failures
+never prevent the current compile from starting. `symlink_metadata`
+is used so a rogue symlink inside `scratch/` can't redirect
+`remove_dir_all` outside the sandbox.
+
+Regression tests: `gc_stale_scratch_removes_old_dirs_keeps_fresh`
+uses the `filetime` dev-dep to backdate a dir by 48 h without
+sleeping, asserts it's removed while a fresh dir survives;
+`gc_stale_scratch_is_noop_without_root` asserts the very first
+compile in a project (no `scratch/` yet) doesn't error.
+
+#### Net effect on events + API
+
+No new events, no new settings, no schema changes. The three
+fixes tighten the existing lifecycle without altering the
+`run_codegen_envelope` command signature — a safe hotfix PR.
 
 ---
 

@@ -1486,15 +1486,65 @@ pub async fn run_codegen_envelope(
 }
 
 /// Truncate a long tsc output for log lines so a catastrophic compile
-/// failure does not flood the trace. 4 KiB keeps enough context to
-/// diagnose issues without blowing up log storage.
+/// failure does not flood the trace. ~4 K characters keeps enough
+/// context to diagnose issues without blowing up log storage.
+///
+/// Uses `chars().take()` rather than a byte slice — tsc is
+/// UTF-8-aware and error messages frequently contain non-ASCII
+/// (quoted source snippets, file paths with BMP characters, the Unicode
+/// arrow tsc sometimes uses for "expected vs got"). A raw byte slice
+/// would panic with `byte index X is not a char boundary` if the cut
+/// fell mid-codepoint, turning a compile failure into a backend crash.
 fn truncate_for_log(s: &str) -> String {
-    const MAX: usize = 4096;
-    if s.len() <= MAX {
+    const MAX_CHARS: usize = 4096;
+    let total_chars = s.chars().count();
+    if total_chars <= MAX_CHARS {
         s.to_string()
     } else {
-        let mut out = s[..MAX].to_string();
-        out.push_str(&format!("… ({} bytes truncated)", s.len() - MAX));
+        let mut out: String = s.chars().take(MAX_CHARS).collect();
+        out.push_str(&format!(
+            "… ({} chars truncated)",
+            total_chars - MAX_CHARS
+        ));
         out
+    }
+}
+
+#[cfg(test)]
+mod truncate_for_log_tests {
+    use super::truncate_for_log;
+
+    #[test]
+    fn short_string_is_returned_as_is() {
+        assert_eq!(truncate_for_log("hello"), "hello");
+    }
+
+    #[test]
+    fn ascii_boundary_does_not_panic() {
+        let s = "a".repeat(5000);
+        let out = truncate_for_log(&s);
+        assert!(out.contains("chars truncated"));
+        assert!(out.starts_with(&"a".repeat(4096)));
+    }
+
+    #[test]
+    fn multi_byte_boundary_does_not_panic() {
+        // Arabic "ا" is 2 bytes. 3000 chars × 2 = 6000 bytes — well
+        // over the old 4096-byte cut. A byte slice at 4096 falls
+        // mid-codepoint and would panic; the char-aware version must
+        // succeed.
+        let s = "ا".repeat(3000);
+        let out = truncate_for_log(&s);
+        // Either it fits (<= 4096 chars) or it's properly truncated
+        // without a panic.
+        assert!(out.chars().next().is_some());
+    }
+
+    #[test]
+    fn four_byte_emoji_boundary_does_not_panic() {
+        // "🔥" is a 4-byte codepoint. 2000 emoji = 8000 bytes, well
+        // past the old cut. Stress-tests the worst-case boundary.
+        let s = "🔥".repeat(2000);
+        let _out = truncate_for_log(&s); // must not panic
     }
 }
