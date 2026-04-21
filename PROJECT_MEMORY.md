@@ -833,5 +833,354 @@ emitter cannot grow `events` beyond 500 entries.
 
 ---
 
+## 10. Audit After PR #12 — user-pushed changes on `main`
+
+Between the `F-4 model-capability guardrail` PR (#12, SHA `2f3f334`) and
+the `scope warn_action dedup to current turn` merge (#15, SHA
+`e957ed2`), `origin/main` received changes from two very different
+sources:
+
+1. **Reviewer-driven fixes** landed as normal PRs (#13, #15). These were
+   scoped, reviewed, and documented in §§4, 8, 9 as they shipped.
+2. **Four commits pushed directly by the maintainer** on top of #12
+   without passing through the planner → PR → Devin-Review → merge
+   workflow:
+   - `2002e77` — `feat(desktop): modern model preset pills + defaults + OpenRouter catalog matching`
+   - `fdb8346` — `Settings UI overhaul: OpenRouter model browser with All/Free tabs, provider cards layout, removed preset buttons`
+   - `7033ad0` — `desktop: multi-terminal sessions + resizable bottom panel`
+   - `d52eb98` — `fix: terminal component fixes — add onRunningChange prop, handle runningTerminals in dependency array`
+
+   These introduced:
+   - a new **`failures_log` store slice** (`desktop/frontend/src/store.ts`
+     +23 lines) with cap-50 ring buffer, newest-first sort, and an
+     auto-open-debug side effect on `pushFailure`
+   - new **Tauri commands** `load_failures_log` / `clear_failures_log`
+     / `run_cmd_stream` / `terminal_kill` and a new `terminal_pids:
+     AsyncMutex<HashMap<String, u32>>` slot on `AppState`
+   - new UI: `components/Terminal.tsx` (160 lines), `components/TerminalManager.tsx` (144 lines), an inline `FailuresPanel` in `App.tsx`, and a three-tab bottom panel (`debug` / `terminal` / `failures`) with a resizable divider
+   - a major **Settings pane overhaul** (`components/Settings.tsx` grew from ~480 → 1221 lines): the preset buttons were removed, OpenRouter models are now browsed via an All/Free tabbed catalog fed by `OpenRouter_Categorized_Models.csv` (a new 684-line data file committed under repo root), per-provider cards replace the previous flat layout, and the F-4 `SmallModelWarning` / `modelLooksSmall` helpers from #12 were preserved as an exported function
+   - a replacement of `tauri.conf.json`'s previously-empty
+     `beforeBuildCommand` / `beforeDevCommand` hooks with
+     `powershell -NoProfile -Command "Set-Location (Resolve-Path
+     ..\\frontend); bun run build"` (and the equivalent `run dev`)
+   - new `vite.config.ts` / `vite-env.d.ts` entries
+
+This section is the honest post-facto code review of that batch —
+the one that didn't happen before it hit `main`.
+
+### 10.1 Confirmed bugs
+
+#### A-1 (HIGH, multi-terminal effectively broken)
+
+`TerminalManager.tsx:42` lists **`runningTerminals` in its `useEffect`
+dependency array**. The effect body calls `setRunningTerminals(new
+Set())` on line 34 and then hands out a fresh `terminalId` + resets
+`tabs` on lines 39–41. The child `Terminal` component announces its
+transitions back via `onRunningChange` (`Terminal.tsx:27`), which
+calls `handleRunningChange` (`TerminalManager.tsx:64`) which itself
+produces a **new `Set` reference** on every start/stop.
+
+Consequence: the moment a user types a command and the child flips
+`running → true`, the parent effect re-fires because its dependency
+changed, it kills every running terminal (including the one that just
+started), and replaces the tab list with a single fresh tab whose id
+is new. The user sees their command die immediately after launch and
+the tabs get blown away mid-run. The `d52eb98` commit message says it
+is a "fix" for this flow, but the fix only added an `onRunningChange`
+prop — it did not remove `runningTerminals` from the dependency
+array. The regression stands.
+
+Correct fix: the effect's sole legitimate dependency is `projectDir`.
+Kill-on-project-change can use a `useRef<Set<string>>` that the
+`handleRunningChange` callback updates imperatively, avoiding the
+feedback loop.
+
+#### A-2 (HIGH, persisted failures log silently wiped on every open)
+
+`tasks.rs:349-354` defines `clear_failures_log(project_dir)` which
+overwrites the `failures_log` array in the **project's on-disk**
+`PROJECT_MEMORY.json` (the backing store, not this file) with an
+empty array and sync-saves.
+
+`App.tsx` calls this on two paths:
+
+- `openProject` (line 169): immediately after the user picks a
+  directory, before loading anything
+- the boot-time auto-restore `useEffect` (line 206): immediately after
+  `setProjectDir(last)`
+
+Both call sites are followed by `clearFailures()` on the in-memory
+Zustand slice. The inline comment on line 167 says "Scope failures to
+the newly-opened project. This intentionally resets the prior
+project's failures view" — but the backend log is already
+project-scoped (the file lives under the project directory). Clearing
+the *newly-opened* project's log on open is exactly the opposite of
+what persistence means: every time a project is reopened, the entire
+history of prior failures for that project is destroyed before the
+user even sees it. The `load_failures_log` call on line 135 races the
+clear and will usually win on UI mount, but the on-disk record is
+gone regardless.
+
+The same race explains why `failures` in the bottom-panel Failures
+tab generally looks empty across restarts despite the store slice and
+`FAILURES_CAP = 50` (`store.ts:14`) being set up correctly.
+
+Correct fix: remove both `clearFailuresLog` calls. The load path
+already replaces the in-memory slice atomically via `setFailures`; no
+disk clear is needed to "scope" anything, because the file backing
+this project's failures only exists under this project.
+
+#### A-3 (HIGH, non-Windows dev & build broken out of the box)
+
+`desktop/src-tauri/tauri.conf.json:6-9` now hard-codes:
+
+```json
+"beforeBuildCommand": "powershell -NoProfile -Command \"Set-Location (Resolve-Path ..\\frontend); bun run build\"",
+"beforeDevCommand":   "powershell -NoProfile -Command \"Set-Location (Resolve-Path ..\\frontend); bun run dev\""
+```
+
+Before the user commits these fields were the empty string (the Tauri
+flow expected the dev to run `bun run build` in `desktop/frontend`
+themselves before `cargo tauri build`). The new values invoke
+PowerShell, which is not present by default on Linux CI runners or on
+a fresh macOS install, and uses back-slash paths that wouldn't resolve
+cleanly on POSIX even if `pwsh` were installed. `bun run tauri dev`
+and `bun run tauri build` therefore fail immediately on any
+non-Windows machine — including the canonical dev environment this
+repo is being developed in.
+
+Correct fix: use a cross-platform invocation such as
+`"beforeBuildCommand": "bun --cwd ../frontend run build"` (Bun is
+already the declared runtime; `--cwd` is portable). The Windows
+launcher script `scripts/run-snapshot.ps1` can keep its PowerShell
+wrapping; `tauri.conf.json` should not.
+
+#### A-4 (MEDIUM, tab close leaks child processes)
+
+`TerminalManager.tsx` closes a tab purely by removing its entry from
+`tabs` state. Neither `Terminal` nor `TerminalManager` calls
+`api.terminalKill(terminalId)` on unmount / remove. `run_cmd_stream`
+is a long-running Tauri command that keeps a child alive until the
+process exits or `terminal_kill` is called, so closing a tab with a
+running command leaves an orphan `sh -c …` (or `cmd /C …` on Windows)
+running under the Tauri app's process tree until the app itself
+quits.
+
+Correct fix: `Terminal` should call `terminalKill` in its cleanup
+function when `running` is `true` at unmount time. `TerminalManager`
+should do the same for the tab being removed.
+
+#### A-5 (MEDIUM, unbounded terminal output grows forever)
+
+`Terminal.tsx:38-46` appends every `terminal:output` chunk to the
+`lines` state array with no cap:
+
+```ts
+setLines((prev) => [
+  ...prev,
+  { id: lineIdRef.current++, stream: ..., text: p.data },
+]);
+```
+
+A command that streams a lot (`yarn install`, `cargo build`, `find /`)
+piles megabytes into a single React state array with dynamic-height
+rows, with no virtualization. The Debug pane adopted a 500-event ring
+buffer in Phase 5.1 (`EVENTS_CAP`) precisely because this pattern
+jams the UI — the new Terminal did not pick up the lesson.
+
+Correct fix: mirror the Debug pattern — a per-tab ring buffer (e.g.,
+5 000 lines) and, longer-term, react-window virtualization driven by
+`useDynamicRowHeight`.
+
+#### A-6 (MEDIUM, Ctrl+C steals the copy affordance)
+
+`Terminal.tsx:115-122` handles `e.key === "c" && e.ctrlKey` by
+preventing default, calling `terminalKill` if `running`, and clearing
+the input. The preventDefault runs regardless of whether there is a
+text selection, so a user who selects terminal output and hits Ctrl+C
+to copy instead loses their selection and — if a command is running
+— kills the process.
+
+Correct fix: only preventDefault + kill when `running` is true **and**
+`window.getSelection()?.toString()` is empty. Otherwise let the
+browser's default copy behaviour proceed.
+
+#### A-7 (MEDIUM, `setRunning(false)` race between RPC return and event)
+
+`Terminal.tsx:92` sets `running = false` immediately after
+`await api.runCmdStream(...)` returns, and line 53 also sets it to
+`false` on receipt of `terminal:done`. Tauri's event bus is async
+relative to command replies, so the RPC usually returns before the
+final `terminal:output` chunks are dispatched. The input becomes
+enabled, the user can start typing, and late output from the previous
+command lands in the output pane while they're drafting the next one.
+
+Correct fix: do not touch `running` on the RPC reply path — let the
+event-driven `terminal:done` be the sole authority, which is what the
+Rust side already treats as the completion signal (it emits
+`terminal:done` **after** draining stdout/stderr; see
+`tools.rs:588-601`).
+
+#### A-8 (MEDIUM, dedup comment in ai.rs drifted against current
+reality)
+
+The `warn_action` dedup introduced by PR #13 / tightened by PR #15
+lives in `ai::run_chat_turn`. The surrounding comment still claims
+the set is scoped "across iterations" without mentioning that the set
+is now cleared on each turn and that the **reviewer no longer
+participates in the dedup at all** in `json_mode` (since #15 skips the
+reviewer entirely in that mode at `ai.rs:1679`). The code is correct;
+the comment is out of date. This is low-risk but confusing to the
+next reader. Fix by an in-place doc pass on the dedup set and the
+early-skip branch.
+
+### 10.2 Confirmed behavioural regressions vs. PR #12
+
+#### R-1 (LOW, OpenRouter preset buttons removed without a replacement
+   migration hint)
+
+`fdb8346` removed the per-role "preset" buttons that pre-populated
+Planner / Executor / Reviewer with curated models. The new
+OpenRouter browser is strictly more powerful, but users whose
+workflow relied on "just hit the Claude preset" now need to type or
+pick a model from a 684-entry catalog. There is no one-time tip,
+default re-seed, or "pick a recommended set" affordance on the new
+layout. Minor UX regression; worth a follow-up.
+
+#### R-2 (LOW, `SmallModelWarning` now only renders under one of the
+   three fields in Cloud mode)
+
+In the pre-overhaul layout, the warning sat under Planner **and**
+Executor fields unconditionally. In the overhauled layout it is
+conditional on `provider` card visibility — the Ollama card's
+`ollama_model` field gains the warning only in Local / Hybrid mode.
+When a user picks a small model via the OpenRouter browser (e.g.
+`meta-llama/llama-3.2-1b-instruct`), `modelLooksSmall` matches
+correctly on the `executor_model` path at `Settings.tsx:920`, so the
+guardrail still fires. Worth a manual scan before the next Scenario A
+retry.
+
+### 10.3 Memory, performance, and stability
+
+- **P-1 (LOW)** `run_cmd_stream` uses two 512-byte buffers and
+  `read` in a `tokio::select!`. If a process emits a UTF-8 sequence
+  that straddles a 512-byte boundary, `String::from_utf8_lossy` will
+  replace the split bytes with `U+FFFD`. The emitted `text` is lossy
+  forever. For English-only output this is cosmetically fine; for
+  programs that print Arabic (very likely in this repo's target
+  audience), this will produce visible mojibake. `tokio::io::BufReader`
+  with `read_line` or a streaming UTF-8 decoder would preserve
+  multibyte characters.
+- **P-2 (LOW)** `terminal_pids` is keyed by `terminal_id`, but there
+  is no guard preventing two simultaneous `run_cmd_stream` invocations
+  with the same id. The second `spawn` would overwrite the stored PID,
+  and a `terminal_kill` would kill only the second child — the first
+  becomes an orphan until process exit. Unlikely with current UI
+  (input is disabled while `running`) but trivial to avoid with an
+  `Entry::Vacant` check at insertion time.
+- **P-3 (LOW)** The failures slice uses `[...fs, failure].slice(-cap)`
+  on every push (`store.ts:pushFailure`). Correct behaviour, but on a
+  burst of 100 failures this copies the whole array 100 times. For
+  `cap=50` it's a non-issue; flagged only so the next reader knows
+  not to grow `FAILURES_CAP` beyond a few hundred without switching
+  to a ring-buffer data structure.
+
+### 10.4 Security
+
+- **S-1 (existing, not new)** `run_cmd_stream` is a direct-invocation
+  Tauri command with no allow-list gating, documented in
+  `tools.rs:11-14` as intentional: "the direct `run_cmd` Tauri command
+  remains unrestricted so the UI's own Terminal/Explorer surfaces can
+  run arbitrary commands with user intent." The multi-terminal
+  feature now exposes this to **N concurrent invocations** from the
+  same frontend. No new vulnerability per se, but the surface area
+  for frontend-compromise scenarios (e.g. a prompt-injection that
+  causes the assistant to write JSX into a bubble that slips past our
+  plain-text rendering) scaled up N× without review.
+- **S-2 (existing, not new)** `terminal_kill` by PID is guarded by
+  `terminal_pids` ownership but does not verify that the PID still
+  belongs to **our** spawned child before sending `SIGTERM` (Unix) or
+  calling `taskkill /T /F` (Windows). On rapid PID recycling this
+  could kill an unrelated process. `map.remove` happens *before* the
+  kill syscall (`tools.rs:598-601`), so the window is small, but not
+  zero. A defensive fix: capture the `Child` handle (not just the
+  PID) and kill via `child.kill().await`.
+
+### 10.5 Documentation drift — items that used to be in §4 / §6
+
+The §4 architecture diagram and §6 Zustand slice inventory predate
+all four user commits. The following live parts of the system are
+now **undocumented** in this file:
+
+1. `store.ts` gained `failures`, `setFailures`, `pushFailure`,
+   `clearFailures`, and `FAILURES_CAP = 50`. Not in §6.
+2. `App.tsx` gained `bottomTab: "debug" | "terminal" | "failures"`
+   and `bottomPanelHeight` state. Not in §4.
+3. Three new Tauri commands (`run_cmd_stream`, `terminal_kill`,
+   `load_failures_log`, `clear_failures_log`) + one new `AppState`
+   field (`terminal_pids`). Not in §4 or §7.
+4. Two new event types (`terminal:output`, `terminal:done`). Not in
+   §5 (event taxonomy).
+5. `components/Terminal.tsx`, `components/TerminalManager.tsx`, and
+   the inline `FailuresPanel` in `App.tsx`. Not in §7 (critical files
+   map). `FailuresPanel` should live in its own file.
+6. `OpenRouter_Categorized_Models.csv` (684 lines, ~60 KB) is now a
+   runtime asset Settings depends on. Its shape, source, refresh
+   cadence, and licence are not documented anywhere in the repo.
+7. `components/Settings.tsx` roughly doubled in size; the provider-
+   card layout, All/Free filter semantics, and the behaviour of
+   `modelLooksSmall` against OpenRouter model ids (which tend to
+   encode parameter counts as `…-1b-instruct`, `…-3b-…`, etc.) are
+   not mentioned in §§4, 7, or 9.
+
+Following the "update in the same PR as the change" rule from
+`AGENTS.md` and `CLAUDE.md`, all of this should land alongside the
+user's next real change to one of these files. This section flags
+the drift so that update has a clear scope.
+
+### 10.6 Ideas & follow-ups (non-blocking)
+
+- **I-1** Surface `failures` as a first-class affordance: every row
+  should expose a "Re-run this task" button that reopens the task
+  tree and enqueues just that task with the persisted goal context.
+  Today it is strictly read-only.
+- **I-2** Terminal: ring buffer + ANSI colour renderer (`ansi_up` or
+  similar) + `Ctrl+L` to clear + `ctrl+k` to search. Current terminal
+  is roughly feature-parity with 1980 `cat`.
+- **I-3** Settings: search box over the OpenRouter catalog (684
+  entries is a lot), and persist the selected `All`/`Free` tab + any
+  filter in `settings.json`. Current UI resets to defaults on every
+  app launch.
+- **I-4** Extract `FailuresPanel` from `App.tsx` to its own file under
+  `components/`. App.tsx is now ~510 lines with three unrelated
+  concerns (global state wiring, bottom panel, project lifecycle).
+- **I-5** `modelLooksSmall` is exported but only used inside
+  `Settings.tsx`. If the ai layer were to consult it at runtime (e.g.
+  emit a once-per-run soft warning when the live executor model
+  matches), the guardrail would no longer depend on the user ever
+  opening Settings. This also closes the only remaining gap in F-4.
+- **I-6** The two user commits `2002e77` + `fdb8346` are the same
+  Settings UI rewrite split into two — the history is harder to
+  bisect than it needs to be. Future `main`-direct pushes should
+  squash before push, or come via PR.
+
+### 10.7 Verdict
+
+The provider-routing / UX stack built through PRs #1-#12 is still
+correct end-to-end. The four user-pushed commits added useful
+capability (persistent failures view, multi-terminal, a vastly better
+model browser) but shipped with three **HIGH-severity** regressions
+(A-1, A-2, A-3) that any serious Scenario A retry will hit in the
+first minute. Fixing them is a precondition for validating anything
+else, and the fixes are small — a dependency-array cleanup, two
+deletions in `App.tsx`, and a one-line `tauri.conf.json` change.
+
+The §9.6 item "Retry Scenario A on `qwen2.5-coder:7b` or
+`llama3.1:8b`" remains the right next validation step, but **not
+before** A-1 / A-2 / A-3 are closed. Running on a broken `main` would
+confuse model-capability findings with harness bugs.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
