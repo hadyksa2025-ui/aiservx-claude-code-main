@@ -90,7 +90,11 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
 
   const addTab = useCallback(() => {
     setTabs((prev) => {
-      const nextIndex = prev.length + 1;
+      // Numbering is over *user* tabs only — the pinned Agent tab is an
+      // always-on app surface, not a user session, and must not inflate
+      // the count (otherwise the first user-added tab would be
+      // "Terminal 3" instead of "Terminal 2").
+      const nextIndex = prev.filter((t) => !t.pinned).length + 1;
       const next = { id: newTerminalId(), title: `Terminal ${nextIndex}` };
       return [...prev, next];
     });
@@ -183,12 +187,32 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
       </div>
 
       <div className="terminal-manager-body">
-        <Terminal
-          projectDir={projectDir}
-          terminalId={active.id}
-          agentMode={active.pinned === "agent"}
-          onRunningChange={(running) => handleRunningChange(active.id, running)}
-        />
+        {/*
+         * Render ONE Terminal instance per tab simultaneously and hide
+         * inactive ones with `display:none`. This preserves per-tab state
+         * (lines buffer, running flag, scroll position) and — critically —
+         * keeps each Terminal's `terminal:output` listener mounted at all
+         * times. The Agent tab MUST stay mounted even while the user is
+         * looking at another tab; otherwise every AI tool call emitted for
+         * `terminal_id = "agent-main"` would be silently dropped, breaking
+         * the Terminal Authority invariant in PROJECT_MEMORY.md §12.
+         */}
+        {tabs.map((t) => (
+          <div
+            key={t.id}
+            className="terminal-manager-panel"
+            style={{ display: t.id === active.id ? undefined : "none" }}
+            role="tabpanel"
+            aria-hidden={t.id !== active.id}
+          >
+            <Terminal
+              projectDir={projectDir}
+              terminalId={t.id}
+              agentMode={t.pinned === "agent"}
+              onRunningChange={(running) => handleRunningChange(t.id, running)}
+            />
+          </div>
+        ))}
       </div>
     </div>
   );
