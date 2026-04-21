@@ -2169,6 +2169,18 @@ Fix: add `("fork()", "dangerous.fork_bomb_variant", "fork bomb
 variant")` to the substring needle list so lowercased input
 containing `fork()` matches directly.
 
+**BUG-G3 — `--force-with-lease` telemetry shadowed by `--force`**
+(follow-up review comment on PR-G itself). `"git push --force"`
+is a substring of `"git push --force-with-lease"`, and the former
+was listed first in the dangerous needle table, so the latter
+always attributed `matched_rule = dangerous.force_push` instead
+of `dangerous.force_push_lease`. Security tier (Dangerous) was
+correct either way, but telemetry fidelity matters for UI reason
+text and Phase 2.B audit trails. Fix: swap the two lines so the
+more-specific needle is checked first, with an inline comment
+explaining why these two are the exception to the "order does
+not matter" guidance at the top of the table.
+
 **Regression coverage.**
 - `bare_git_push_f_classifies_as_dangerous` — five variants
   including bare, padded, extra-whitespace, with upstream args,
@@ -2177,13 +2189,15 @@ containing `fork()` matches directly.
   must not match `dangerous.force_push`.
 - `fork_variant_classifies_as_dangerous` — `fork()` alone,
   wrapped in `bash -c '...'`, and uppercase.
+- `force_with_lease_attributes_to_lease_rule` — three variants
+  ensuring `matched_rule = dangerous.force_push_lease`.
 - Three new entries in `dangerous_matrix_blocks` keep the
   existing matrix honest (`git push -f`, `git push -f` with
   padding, `git  push  -f` with extra internal whitespace,
   `fork()`, `bash -c 'fork()'`).
 
-All 124 lib tests pass (`cargo test --lib`: 121 previous +
-3 new regression).
+All 125 lib tests pass (`cargo test --lib`: 121 previous +
+4 new regression).
 
 ### §16.10.2 Deferred informational findings from PR-F review
 
