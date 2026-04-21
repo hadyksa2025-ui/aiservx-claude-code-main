@@ -233,8 +233,13 @@ fn match_dangerous(cmd: &str) -> Option<(&'static str, String)> {
         (" > /etc/", "dangerous.etc_overwrite", "overwriting a file under /etc"),
         (" >> /etc/", "dangerous.etc_append", "appending to a file under /etc"),
         (" > /boot/", "dangerous.boot_overwrite", "writing under /boot"),
-        ("git push --force", "dangerous.force_push", "force push rewrites remote history"),
+        // PR-G: `--force-with-lease` must be checked BEFORE `--force`
+        // because the former contains the latter as a substring. The
+        // security tier is Dangerous either way, but the ordering
+        // matters for `matched_rule` telemetry fidelity so Phase 2.B /
+        // the UI can surface the right reason text.
         ("git push --force-with-lease", "dangerous.force_push_lease", "force-with-lease still rewrites remote"),
+        ("git push --force", "dangerous.force_push", "force push rewrites remote history"),
         ("git reset --hard", "dangerous.reset_hard", "git reset --hard discards uncommitted work"),
         ("git clean -fd", "dangerous.git_clean_fd", "git clean -fd wipes untracked files"),
         ("git clean -fdx", "dangerous.git_clean_fdx", "git clean -fdx wipes untracked + ignored files"),
@@ -1008,6 +1013,30 @@ mod tests {
     // `tools::deny_reason`). Without it, Phase 2.B's migration off
     // `deny_reason` would silently demote `fork()` to Warning.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // PR-G regression: `--force-with-lease` must attribute to
+    // `dangerous.force_push_lease`, not `dangerous.force_push`. Both
+    // are Dangerous, but telemetry fidelity matters for UI reason
+    // text and Phase 2.B audit trails.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn force_with_lease_attributes_to_lease_rule() {
+        for cmd in [
+            "git push --force-with-lease",
+            "git push --force-with-lease origin main",
+            "GIT PUSH --FORCE-WITH-LEASE",
+        ] {
+            let c = classify(cmd);
+            assert_eq!(c.class, SecurityClass::Dangerous);
+            assert_eq!(
+                c.matched_rule, "dangerous.force_push_lease",
+                "expected force_push_lease for `{cmd}`, got {}",
+                c.matched_rule
+            );
+        }
+    }
 
     #[test]
     fn fork_variant_classifies_as_dangerous() {
