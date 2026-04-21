@@ -24,6 +24,7 @@ mod cancel;
 mod codegen_envelope;
 mod compiler_gate;
 mod controller;
+mod dependency_guard;
 mod fs_ops;
 mod memory;
 mod project_scan;

@@ -24,6 +24,7 @@ use tracing::warn;
 use crate::ai::{self, UiMessage};
 use crate::codegen_envelope::{CodegenEnvelope, EnvelopeFile};
 use crate::compiler_gate::{self, CompileOutcome};
+use crate::dependency_guard::{self, GuardOutcome};
 use crate::fs_ops;
 use crate::project_scan;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
@@ -1226,6 +1227,30 @@ fn build_compile_feedback_prompt(
     )
 }
 
+/// Build the executor-facing reprompt when the dependency guard
+/// (Phase 1.C) rejects the previous envelope. Frames phantom imports
+/// as a *project-reality* mismatch so the model doesn't "fix" the
+/// problem by inventing another non-existent package.
+fn build_dependency_feedback_prompt(
+    original_request: &str,
+    guard_feedback: &str,
+) -> String {
+    format!(
+        "{original_request}\n\n\
+         [dependency guard] Your previous envelope imports packages \
+         that are NOT listed in this project's package.json. The \
+         project will not compile with those imports in place, and \
+         inventing another missing package will not help. Read the \
+         miss list below and either rewrite the imports to use a \
+         package that is already installed, or drop the feature that \
+         requires the missing package:\n\
+         {guard_feedback}\n\
+         Emit a NEW, complete codegen envelope. Every `path` must \
+         still be sandbox-relative and every `content` must contain \
+         the FULL file contents."
+    )
+}
+
 /// Tauri command: run a full codegen envelope lifecycle and, on
 /// success, land files into the project sandbox.
 ///
@@ -1262,12 +1287,14 @@ pub async fn run_codegen_envelope(
     history: Vec<UiMessage>,
     autonomous_confirm: bool,
 ) -> Result<AppliedEnvelope, String> {
-    let (gate_enabled, max_compile_retries, tsc_timeout_secs) = {
+    let (gate_enabled, max_compile_retries, tsc_timeout_secs, dep_guard_enabled, dep_guard_mode) = {
         let s = state.read_settings();
         (
             s.compiler_gate_enabled,
             s.max_compile_retries,
             s.tsc_timeout_secs,
+            s.dependency_guard_enabled,
+            s.dependency_guard_mode.clone(),
         )
     };
 
@@ -1287,6 +1314,112 @@ pub async fn run_codegen_envelope(
             autonomous_confirm,
         )
         .await?;
+
+        // ---- Phase 1.C dependency guard ----
+        // Runs before the compiler gate so phantom imports are
+        // caught without burning a full `tsc --noEmit` retry slot.
+        // Shares `max_compile_retries` with the compiler gate —
+        // a guard miss consumes the same attempt budget as a tsc
+        // miss, because each one costs a model round-trip.
+        let guard_outcome = match dependency_guard::check_envelope(
+            std::path::Path::new(&project_dir),
+            &turn.envelope,
+            dep_guard_enabled,
+            &dep_guard_mode,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // Guard must never be the reason a compile refuses
+                // to start — fall back to Skipped and emit a
+                // diagnostic rather than bubbling the error.
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.error",
+                        "status": "warning",
+                        "reason": e,
+                        "attempt": attempt,
+                    }),
+                );
+                GuardOutcome::Skipped { reason: "internal_error" }
+            }
+        };
+        match &guard_outcome {
+            GuardOutcome::Ok { resolved } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.ok",
+                        "status": "done",
+                        "attempt": attempt,
+                        "resolved_count": resolved.len(),
+                    }),
+                );
+            }
+            GuardOutcome::Skipped { reason } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.skipped",
+                        "status": "done",
+                        "reason": reason,
+                        "attempt": attempt,
+                    }),
+                );
+            }
+            GuardOutcome::Warned { missing, .. } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.warned",
+                        "status": "warning",
+                        "attempt": attempt,
+                        "missing": missing,
+                    }),
+                );
+            }
+            GuardOutcome::Missing { missing, .. } => {
+                let feedback = dependency_guard::missing_to_feedback(&guard_outcome);
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.missing",
+                        "status": "failed",
+                        "attempt": attempt,
+                        "missing": missing,
+                    }),
+                );
+                if attempt + 1 >= max_attempts {
+                    return Err(format!(
+                        "dependency guard: envelope imports {} unresolved package(s) after {} attempt(s):\n{feedback}",
+                        missing.len(),
+                        attempt + 1,
+                    ));
+                }
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "guard",
+                        "label": "dependency.retry",
+                        "status": "running",
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                    }),
+                );
+                current_request = build_dependency_feedback_prompt(&original_request, &feedback);
+                // Skip the compiler gate this iteration — we already
+                // know the envelope is structurally wrong.
+                continue;
+            }
+        }
+        // ---- end Phase 1.C dependency guard ----
 
         if let Some(reason) = compiler_gate::skip_policy(gate_enabled, &turn.envelope) {
             let _ = app.emit(
@@ -1529,22 +1662,36 @@ mod truncate_for_log_tests {
 
     #[test]
     fn multi_byte_boundary_does_not_panic() {
-        // Arabic "ا" is 2 bytes. 3000 chars × 2 = 6000 bytes — well
-        // over the old 4096-byte cut. A byte slice at 4096 falls
-        // mid-codepoint and would panic; the char-aware version must
-        // succeed.
-        let s = "ا".repeat(3000);
+        // Arabic "ا" is a 2-byte codepoint. We need *more than
+        // MAX_CHARS* characters to actually enter the truncation
+        // branch — the early Devin Review on PR-C caught that the
+        // previous `.repeat(3000)` left this test dormant inside the
+        // `total_chars <= MAX_CHARS` short-circuit. 5000 × 2 bytes =
+        // 10 000 bytes, and the naive byte slice `s[..4096]` would
+        // land mid-codepoint and panic. The char-aware version must
+        // truncate cleanly and keep every surviving char as `ا`.
+        let s = "ا".repeat(5000);
         let out = truncate_for_log(&s);
-        // Either it fits (<= 4096 chars) or it's properly truncated
-        // without a panic.
-        assert!(out.chars().next().is_some());
+        assert!(out.contains("chars truncated"));
+        assert_eq!(
+            out.chars().take(4096).filter(|&c| c == 'ا').count(),
+            4096,
+            "first 4096 chars must still be intact Arabic letters"
+        );
     }
 
     #[test]
     fn four_byte_emoji_boundary_does_not_panic() {
-        // "🔥" is a 4-byte codepoint. 2000 emoji = 8000 bytes, well
-        // past the old cut. Stress-tests the worst-case boundary.
-        let s = "🔥".repeat(2000);
-        let _out = truncate_for_log(&s); // must not panic
+        // "🔥" is a 4-byte codepoint — the worst-case boundary for a
+        // byte-slicing truncator. Again we need > MAX_CHARS to hit
+        // the truncation branch, not just > MAX_CHARS*bytes.
+        let s = "🔥".repeat(5000);
+        let out = truncate_for_log(&s);
+        assert!(out.contains("chars truncated"));
+        assert_eq!(
+            out.chars().take(4096).filter(|&c| c == '🔥').count(),
+            4096,
+            "first 4096 chars must still be intact 🔥 codepoints"
+        );
     }
 }

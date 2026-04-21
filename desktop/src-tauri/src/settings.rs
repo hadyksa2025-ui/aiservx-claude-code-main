@@ -164,6 +164,28 @@ pub struct Settings {
     /// worst-case case where `tsc` loops on a pathological input.
     #[serde(default = "default_tsc_timeout_secs")]
     pub tsc_timeout_secs: u64,
+    /// Whether the OC-Titan dependency guard (Phase 1.C) runs before
+    /// a generated envelope reaches the compiler gate. The guard
+    /// parses imports / requires / dynamic imports out of every
+    /// ts/tsx/js/jsx file in the envelope and checks that each
+    /// external package specifier is listed under one of
+    /// `dependencies`, `devDependencies`, `peerDependencies`, or
+    /// `optionalDependencies` in the project's `package.json`. It
+    /// defends V6 §I.6 against the common failure mode where the
+    /// model hallucinates a package it has never installed (see
+    /// `OPENROUTER_VALIDATION_REPORT` §3 L2/L3). Defaults to enabled.
+    #[serde(default = "default_true")]
+    pub dependency_guard_enabled: bool,
+    /// What the dependency guard does when it finds an unresolved
+    /// import. `"fail"` (default) aborts the envelope with a
+    /// structured error and re-prompts the model once per
+    /// `max_compile_retries`, matching the compile-gate contract.
+    /// `"warn"` surfaces the diagnostic via `ai:step` but still
+    /// forwards the envelope to the compiler gate — useful when
+    /// iterating on a half-set-up project where `package.json`
+    /// legitimately lags the code.
+    #[serde(default = "default_dependency_guard_mode")]
+    pub dependency_guard_mode: String,
 }
 
 fn default_true() -> bool {
@@ -208,6 +230,13 @@ fn default_max_compile_retries() -> u32 {
 }
 fn default_tsc_timeout_secs() -> u64 {
     120
+}
+fn default_dependency_guard_mode() -> String {
+    // V6 §I.6 "Fail loudly if unresolved" — default to hard-fail so
+    // phantom imports are caught before the compiler gate burns a
+    // retry slot on them. Users can relax this to `"warn"` from
+    // Settings when bootstrapping a new project.
+    "fail".to_string()
 }
 fn default_context_compaction_keep_last() -> u32 {
     // 20 UI messages ≈ 10 user/assistant pairs. Comfortable for
@@ -272,6 +301,8 @@ impl Default for Settings {
             compiler_gate_enabled: true,
             max_compile_retries: default_max_compile_retries(),
             tsc_timeout_secs: default_tsc_timeout_secs(),
+            dependency_guard_enabled: true,
+            dependency_guard_mode: default_dependency_guard_mode(),
         }
     }
 }
