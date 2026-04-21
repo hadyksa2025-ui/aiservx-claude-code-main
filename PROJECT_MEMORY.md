@@ -1308,6 +1308,39 @@ order, with stdout/stderr distinguished, and an `[exit N]` line that
 closes each `run_cmd`. There is no code path in the Executor that can
 touch disk or spawn a process without the Agent tab seeing it.
 
+### 12.1 Rendering model (post-PR #19 review fixes)
+
+Phase 0 as originally merged in PR #19 rendered a **single** `Terminal`
+component in `TerminalManager` and swapped its `terminalId` prop on tab
+switch. Devin Review flagged two bugs against this approach:
+
+1. **🔴 Lost agent events.** `Terminal.tsx`'s `terminal:output` listener
+   filters by `terminalId`, so it only captured events for whichever
+   tab was currently active. Any tool call emitted for
+   `terminal_id = "agent-main"` while the user was looking at a user
+   terminal was silently dropped — a direct violation of the invariant
+   above.
+2. **🟡 Numbering glitch.** `addTab` computed the new title from
+   `prev.length + 1`, which included the pinned Agent tab, so the
+   first user-added tab was labelled "Terminal 3" instead of
+   "Terminal 2".
+
+Fix (shipped on top of Phase 0):
+
+* `TerminalManager.tsx` now renders **one `Terminal` instance per tab**
+  wrapped in a `.terminal-manager-panel` div, and hides inactive panels
+  with `display: none` (role `tabpanel`, `aria-hidden` on inactive
+  panels). Each `Terminal` keeps its own mounted `terminal:output`
+  listener and its own `lines` buffer across tab switches, so Agent
+  events are captured continuously regardless of which tab is visible.
+* `addTab` now counts `prev.filter(t => !t.pinned).length + 1` — pinned
+  tabs never inflate the user-visible numbering.
+
+The invariant in §12 is only actually true with these fixes in place.
+When you re-read this section, treat §12 and §12.1 as a single unit:
+the rendering model is **part of** the Terminal Authority contract,
+not an implementation detail.
+
 ---
 
 *If something here is wrong or incomplete, fix it in-place rather than

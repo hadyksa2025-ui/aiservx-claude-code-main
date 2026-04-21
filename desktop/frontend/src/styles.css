@@ -2021,6 +2021,15 @@ button.system-action:hover {
 .terminal-manager-body {
   flex: 1;
   min-height: 0;
+  position: relative;
+}
+
+/* One panel per terminal tab; inactive ones are display:none so their
+   Terminal stays mounted and its `terminal:output` listener keeps
+   capturing events. See PROJECT_MEMORY.md §12 Terminal Authority. */
+.terminal-manager-panel {
+  height: 100%;
+  min-height: 0;
 }
 
 /* Agent tab: always-on, pinned left. Subtle accent so it reads as a
