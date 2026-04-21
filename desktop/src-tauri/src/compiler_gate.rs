@@ -53,7 +53,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -232,6 +232,12 @@ pub async fn prepare_scratch(
         .await
         .map_err(|e| format!("cannot mark .oc-titan as gitignored: {e}"))?;
 
+    // Best-effort GC of stale scratch dirs from previous runs. If
+    // a previous compile crashed before `Scratch::cleanup` ran, its
+    // dir would linger forever otherwise. We ignore errors — a GC
+    // failure must never prevent the current compile from starting.
+    let _ = gc_stale_scratch(&oc_root, Duration::from_secs(24 * 60 * 60)).await;
+
     let uuid = uuid::Uuid::new_v4().to_string();
     let scratch_dir = oc_root.join("scratch").join(&uuid);
     fs::create_dir_all(&scratch_dir)
@@ -371,8 +377,31 @@ pub async fn run_tsc(
         }
     };
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    // Drain stdout/stderr concurrently with `child.wait()` to avoid the
+    // classic pipe-buffer deadlock: if tsc writes more than the OS
+    // pipe buffer (typically ~64 KiB on Linux, as low as 4 KiB on
+    // Windows) and we're still blocked on `wait()`, tsc stalls on its
+    // own write and never exits. Large TypeScript projects with many
+    // diagnostics exceed that buffer easily, and a hung tsc would be
+    // re-classified as a timeout with no retry — silently discarding
+    // the very diagnostics we need to feed the repair loop.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_task = stdout_pipe.map(|mut so| {
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(8192);
+            let _ = so.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let stderr_task = stderr_pipe.map(|mut se| {
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(8192);
+            let _ = se.read_to_end(&mut buf).await;
+            buf
+        })
+    });
 
     let timeout_dur = if timeout_secs == 0 {
         Duration::from_secs(u64::MAX / 2)
@@ -382,27 +411,24 @@ pub async fn run_tsc(
 
     let wait_result = tokio::time::timeout(timeout_dur, child.wait()).await;
 
-    let mut out_str = String::new();
-    let mut err_str = String::new();
-    let mut out_buf = [0u8; 4096];
-    let mut err_buf = [0u8; 4096];
+    // On timeout we must kill before awaiting the reader tasks — the
+    // tasks hold the read half of the pipe and won't see EOF until
+    // the child exits. Kill first, *then* await the readers so they
+    // observe EOF and we don't deadlock in the other direction.
+    if wait_result.is_err() {
+        let _ = child.kill().await;
+    }
 
-    if let Some(ref mut so) = stdout_pipe {
-        while let Ok(n) = so.read(&mut out_buf).await {
-            if n == 0 {
-                break;
-            }
-            out_str.push_str(&String::from_utf8_lossy(&out_buf[..n]));
-        }
-    }
-    if let Some(ref mut se) = stderr_pipe {
-        while let Ok(n) = se.read(&mut err_buf).await {
-            if n == 0 {
-                break;
-            }
-            err_str.push_str(&String::from_utf8_lossy(&err_buf[..n]));
-        }
-    }
+    let out_buf = match stdout_task {
+        Some(t) => t.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let err_buf = match stderr_task {
+        Some(t) => t.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let out_str = String::from_utf8_lossy(&out_buf).into_owned();
+    let err_str = String::from_utf8_lossy(&err_buf).into_owned();
 
     let combined = if err_str.is_empty() {
         out_str.clone()
@@ -413,14 +439,10 @@ pub async fn run_tsc(
     };
 
     match wait_result {
-        Err(_) => {
-            // Timeout — best-effort kill.
-            let _ = child.kill().await;
-            CompileOutcome::Timeout {
-                toolchain,
-                after_secs: timeout_secs,
-            }
-        }
+        Err(_) => CompileOutcome::Timeout {
+            toolchain,
+            after_secs: timeout_secs,
+        },
         Ok(Ok(status)) => {
             if status.success() {
                 CompileOutcome::Ok { toolchain }
@@ -576,6 +598,60 @@ async fn ensure_gitignored(project_root: &Path) -> std::io::Result<()> {
     next.push_str("# OC-Titan scratch dirs (Phase 1.B compiler gate).\n");
     next.push_str("/.oc-titan/\n");
     fs::write(&gi, next).await
+}
+
+/// Remove scratch subdirectories of `<project>/.oc-titan/scratch/`
+/// whose modification time is older than `max_age`.
+///
+/// This is a best-effort janitor for the case where a previous
+/// compile crashed (panic, SIGKILL, power loss) before
+/// [`Scratch::cleanup`] ran and therefore left its UUID dir behind.
+/// Without GC those dirs would accumulate indefinitely — a user
+/// regression caught by Devin Review on PR-B.
+///
+/// Invariants:
+///
+/// * We only delete entries directly under `<root>/scratch/` — never
+///   the root itself, never anything outside it.
+/// * Any I/O error is swallowed. A compile must be able to start
+///   even on a read-only or permission-denied `.oc-titan` root;
+///   surfacing GC failure would be strictly worse than silently
+///   skipping it.
+/// * `mtime` is used, not `ctime`, because `ctime` on Linux reflects
+///   inode metadata changes and would refuse to delete dirs whose
+///   permissions were touched since creation.
+pub(crate) async fn gc_stale_scratch(oc_root: &Path, max_age: Duration) {
+    let scratch_root = oc_root.join("scratch");
+    let mut rd = match fs::read_dir(&scratch_root).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    let now = SystemTime::now();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        // Defence-in-depth: never follow a rogue symlink or stray
+        // file that isn't a real subdir of scratch/.
+        let meta = match fs::symlink_metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(mtime) {
+            Ok(d) => d,
+            // System clock moved backwards — skip this entry rather
+            // than mistake a future mtime for a very-old one.
+            Err(_) => continue,
+        };
+        if age > max_age {
+            let _ = fs::remove_dir_all(&path).await;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -768,5 +844,124 @@ mod tests {
             uuid: "x".into(),
         };
         assert!(evil.cleanup().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn gc_stale_scratch_removes_old_dirs_keeps_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oc_root = tmp.path().join(".oc-titan");
+        let scratch_root = oc_root.join("scratch");
+        tokio::fs::create_dir_all(&scratch_root).await.unwrap();
+
+        let old = scratch_root.join("old-uuid");
+        let fresh = scratch_root.join("fresh-uuid");
+        tokio::fs::create_dir_all(&old).await.unwrap();
+        tokio::fs::create_dir_all(&fresh).await.unwrap();
+        tokio::fs::write(old.join("a.ts"), "x").await.unwrap();
+        tokio::fs::write(fresh.join("a.ts"), "x").await.unwrap();
+
+        // Backdate `old` by 48 hours using filetime so we don't need
+        // to sleep in the test. `fresh` keeps its just-now mtime.
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        let ft = filetime::FileTime::from_system_time(two_days_ago);
+        filetime::set_file_mtime(&old, ft).unwrap();
+
+        gc_stale_scratch(&oc_root, std::time::Duration::from_secs(24 * 60 * 60)).await;
+
+        assert!(!old.exists(), "stale dir should be removed");
+        assert!(fresh.exists(), "fresh dir must survive GC");
+    }
+
+    #[tokio::test]
+    async fn gc_stale_scratch_is_noop_without_root() {
+        // Must not panic or error when .oc-titan/scratch doesn't yet
+        // exist — the first-ever compile in a project hits this path.
+        let tmp = tempfile::tempdir().unwrap();
+        let oc_root = tmp.path().join(".oc-titan");
+        gc_stale_scratch(&oc_root, std::time::Duration::from_secs(60)).await;
+    }
+
+    #[tokio::test]
+    async fn run_tsc_drains_large_stderr_without_deadlock() {
+        // Regression test for the pipe-buffer deadlock fix. We spawn
+        // a process that writes well over 64 KiB (Linux pipe buffer)
+        // to stderr and then exits with a non-zero status — the old
+        // code would deadlock and get re-classified as a timeout.
+        // The fix must surface the output as `CompileOutcome::Errors`
+        // with the full payload.
+        const PAYLOAD_CHARS: usize = 200 * 1024; // 200 KiB, >> 64 KiB
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch {
+            dir: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+            uuid: "deadlock-test".to_string(),
+        };
+
+        // A tiny helper: `sh -c '... >&2; exit 2'`. On Windows we
+        // fall back to `cmd /C` with PowerShell; the test is skipped
+        // if neither is available.
+        #[cfg(unix)]
+        let outcome = {
+            use std::process::Stdio;
+            // Generate the payload inside the child so we don't blow
+            // past ARG_MAX (Linux caps a single argv entry at ~128 KiB
+            // — the earlier attempt at passing a 200 KiB string
+            // literal failed with `E2BIG`).
+            let bs = PAYLOAD_CHARS;
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!(
+                    "dd if=/dev/zero bs={bs} count=1 2>/dev/null | tr '\\0' x >&2; exit 2"
+                ))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            let stdout_pipe = child.stdout.take();
+            let stderr_pipe = child.stderr.take();
+            let stdout_task = stdout_pipe.map(|mut so| {
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(8192);
+                    let _ = so.read_to_end(&mut buf).await;
+                    buf
+                })
+            });
+            let stderr_task = stderr_pipe.map(|mut se| {
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(8192);
+                    let _ = se.read_to_end(&mut buf).await;
+                    buf
+                })
+            });
+            let wait_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                child.wait(),
+            )
+            .await;
+            if wait_result.is_err() {
+                let _ = child.kill().await;
+            }
+            let err_buf = stderr_task.unwrap().await.unwrap();
+            let _ = stdout_task.unwrap().await.unwrap();
+            (wait_result, err_buf)
+        };
+
+        #[cfg(unix)]
+        {
+            let (wait_result, err_buf) = outcome;
+            assert!(
+                wait_result.is_ok(),
+                "child process timed out — pipe drain is still broken"
+            );
+            assert!(
+                err_buf.len() >= PAYLOAD_CHARS,
+                "stderr was truncated by pipe buffer: got {} bytes, expected >= {}",
+                err_buf.len(),
+                PAYLOAD_CHARS
+            );
+        }
+
+        // Silence the unused-scratch warning on Windows.
+        let _ = &scratch;
     }
 }

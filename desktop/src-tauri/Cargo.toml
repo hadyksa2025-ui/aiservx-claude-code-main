@@ -64,6 +64,9 @@ libc = "0.2"
 bytes = "1"
 # Scratch-dir fixtures for the OC-Titan compiler gate tests.
 tempfile = "3"
+# Used by the scratch-GC test to backdate directory mtimes without
+# sleeping, so the test runs in milliseconds instead of 24 hours.
+filetime = "0.2"
 
 [features]
 default = ["custom-protocol"]
