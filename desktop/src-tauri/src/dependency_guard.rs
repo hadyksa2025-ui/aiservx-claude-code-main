@@ -197,12 +197,22 @@ static BUILTIN_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| NODE_BUILTINS.ite
 static COMMENT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"//[^\n]*|/\*[\s\S]*?\*/"#).expect("COMMENT_RE"));
 
-// `import … from 'foo'` / `import … from "foo"`
+// `import … from 'foo'` / `import … from "foo"` / `import … from `foo` `
 // Also catches `import type { … } from 'foo'` and `export … from 'foo'`.
-// The `[^'"\n;]*?` middle section is non-greedy so we don't
-// accidentally bridge across sibling import statements.
+// The middle section excludes quotes and `;` so we don't bridge
+// across sibling import statements, but deliberately DOES allow
+// newlines — LLM-generated code frequently splits destructured
+// imports over multiple lines:
+//
+//     import {
+//       useState,
+//       useEffect,
+//     } from 'react';
+//
+// Earlier versions of this regex excluded `\n` and silently missed
+// every such import (Devin Review PR #4 comment 3120401607).
 static FROM_IMPORT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b(?:import|export)\s+[^'"\n;]*?\bfrom\s*(['"])([^'"]+)['"]"#)
+    Regex::new(r#"\b(?:import|export)\s+[^'"`;]*?\bfrom\s*(['"`])([^'"`]+)['"`]"#)
         .expect("FROM_IMPORT_RE")
 });
 
@@ -210,15 +220,16 @@ static FROM_IMPORT_RE: Lazy<Regex> = Lazy::new(|| {
 // We require the keyword at word boundary and immediately followed
 // by whitespace + quote so we don't match `import(` or similar.
 static BARE_IMPORT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\bimport\s+(['"])([^'"]+)['"]"#).expect("BARE_IMPORT_RE"));
+    Lazy::new(|| Regex::new(r#"\bimport\s+(['"`])([^'"`]+)['"`]"#).expect("BARE_IMPORT_RE"));
 
 // CommonJS: `require('foo')`
 static REQUIRE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\brequire\s*\(\s*(['"])([^'"]+)['"]\s*\)"#).expect("REQUIRE_RE"));
+    Lazy::new(|| Regex::new(r#"\brequire\s*\(\s*(['"`])([^'"`]+)['"`]\s*\)"#).expect("REQUIRE_RE"));
 
-// Dynamic ESM: `import('foo')`
+// Dynamic ESM: `import('foo')` — including the rare but valid
+// template-literal form `import(`foo`)` that some tools emit.
 static DYNAMIC_IMPORT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\bimport\s*\(\s*(['"])([^'"]+)['"]\s*\)"#).expect("DYNAMIC_IMPORT_RE"));
+    Lazy::new(|| Regex::new(r#"\bimport\s*\(\s*(['"`])([^'"`]+)['"`]\s*\)"#).expect("DYNAMIC_IMPORT_RE"));
 
 /// Does the envelope contain at least one file whose extension we
 /// know how to analyse? The guard short-circuits to
@@ -372,10 +383,14 @@ pub fn check_envelope_with_deps(
                 resolved.insert(root);
             } else {
                 missing.insert(root);
-                per_file
-                    .entry(file.path.clone())
-                    .or_default()
-                    .push(spec);
+                // Dedupe per-file raw specifiers so the model gets a
+                // clean miss list — e.g. two imports from the same
+                // phantom package in the same file (Devin Review PR
+                // #4 comment 3120401725) should only appear once.
+                let entry = per_file.entry(file.path.clone()).or_default();
+                if !entry.iter().any(|s| s == &spec) {
+                    entry.push(spec);
+                }
             }
         }
     }
@@ -743,6 +758,111 @@ mod tests {
         match out {
             GuardOutcome::Missing { missing, .. } => {
                 assert_eq!(missing, vec!["zustand".to_string()]);
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    // --- Regression tests for PR-D Devin Review findings ---
+    // (PR #4 review comments 3120401607, 3120401509, 3120401725)
+
+    #[test]
+    fn extract_handles_multi_line_from_import() {
+        // Before PR-E, `FROM_IMPORT_RE` excluded `\n`, so destructured
+        // imports spread over multiple lines were silently dropped —
+        // which happens to be the shape LLMs emit most often.
+        let src = r#"
+            import {
+                useState,
+                useEffect,
+            } from 'react';
+            import type {
+                FC,
+                ReactNode,
+            } from 'react';
+        "#;
+        let got = extract_specifiers(src);
+        assert!(got.iter().any(|s| s == "react"), "multi-line default/destructured import missed: {got:?}");
+    }
+
+    #[test]
+    fn extract_handles_multi_line_export_from() {
+        let src = r#"
+            export {
+                foo,
+                bar,
+            } from '@scope/pkg';
+        "#;
+        let got = extract_specifiers(src);
+        assert!(got.iter().any(|s| s == "@scope/pkg"), "multi-line re-export missed: {got:?}");
+    }
+
+    #[test]
+    fn extract_handles_backtick_template_literal_imports() {
+        // Dynamic `import(`pkg`)` and side-effect `import `pkg`` are
+        // rare but valid. PR-D's regexes only matched `'` / `"` —
+        // the doc claimed otherwise, which was the actual bug.
+        let src = r#"
+            const m = await import(`lodash`);
+            import `side-effect-pkg`;
+            const fs = require(`node:fs`);
+        "#;
+        let got = extract_specifiers(src);
+        assert!(got.iter().any(|s| s == "lodash"), "backtick dynamic import missed: {got:?}");
+        assert!(got.iter().any(|s| s == "side-effect-pkg"), "backtick bare import missed: {got:?}");
+        assert!(got.iter().any(|s| s == "node:fs"), "backtick require missed: {got:?}");
+    }
+
+    #[test]
+    fn extract_does_not_bridge_across_semicolons() {
+        // Dropping `\n` from the exclusion class could theoretically
+        // let the non-greedy middle section bridge across sibling
+        // statements. The semicolon stop prevents that.
+        let src = r#"
+            import sideEffect; import b from "y";
+        "#;
+        let got = extract_specifiers(src);
+        // We should still find "y" (the valid import) and NOT
+        // accidentally match the bare `sideEffect` as a specifier.
+        assert!(got.iter().any(|s| s == "y"), "expected y in {got:?}");
+    }
+
+    #[test]
+    fn guard_dedupes_per_file_raw_specifiers() {
+        // Two imports from the same phantom package in the same file
+        // should surface the spec only once in per_file.
+        let e = env(&[(
+            "src/a.ts",
+            "import { create } from 'zustand';\nimport { devtools } from 'zustand';",
+        )]);
+        let d = deps(&[]);
+        let out = check_envelope_with_deps(&e, &d);
+        match out {
+            GuardOutcome::Missing { missing, per_file } => {
+                assert_eq!(missing, vec!["zustand".to_string()]);
+                assert_eq!(
+                    per_file.get("src/a.ts").cloned().unwrap_or_default(),
+                    vec!["zustand".to_string()],
+                    "per_file must dedupe identical raw specifiers"
+                );
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_catches_multi_line_phantom_import_end_to_end() {
+        // Combines BUG-3 (multi-line) with a phantom package — this
+        // is the LLM failure mode the guard exists to catch.
+        let e = env(&[(
+            "src/a.tsx",
+            "import {\n  QueryClient,\n  QueryClientProvider,\n} from '@tanstack/react-query';",
+        )]);
+        let d = deps(&["react"]);
+        let out = check_envelope_with_deps(&e, &d);
+        match out {
+            GuardOutcome::Missing { missing, .. } => {
+                assert_eq!(missing, vec!["@tanstack/react-query".to_string()]);
             }
             other => panic!("expected Missing, got {other:?}"),
         }

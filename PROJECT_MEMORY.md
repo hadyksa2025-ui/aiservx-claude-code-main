@@ -1718,7 +1718,10 @@ ignored — JSON, CSS, MD, etc. never import packages):
 Comments are stripped first (line `//` and block `/* */`) so the
 guard does not flag imports that are deliberately commented out.
 String literals use single, double, or backtick quotes — the regex
-set covers all three.
+set covers all three. The middle section of `FROM_IMPORT_RE`
+excludes quotes and `;` but deliberately allows newlines, so
+multi-line destructured imports (the shape LLMs emit most often)
+are caught.
 
 ### Specifier classification
 
@@ -1805,7 +1808,7 @@ must never be the reason a compile refuses to start.
 
 ### `ai:step` events (Terminal Authority, V6 §VI.1)
 
-Five new events, all with `role: "guard"`:
+Six new events, all with `role: "guard"`:
 
 - `dependency.ok` — `status: "done"`, carries `resolved_count`.
 - `dependency.skipped` — `status: "done"`, carries `reason`.
@@ -1838,6 +1841,42 @@ two failure modes apart (phantom import vs bad TypeScript).
 - `check_envelope_skips_when_disabled` /
   `check_envelope_skips_without_package_json` /
   `check_envelope_detects_missing_end_to_end`
+
+## §15.1 Phase 1.C hotfix (PR-E) — regex + doc corrections
+
+PR-E addresses four issues flagged by Devin Review on PR #4:
+
+- **BUG-1 (doc, `PROJECT_MEMORY.md`, comment 3120401417)**: §15 said
+  "Five new events" but six are emitted (`ok`, `skipped`, `warned`,
+  `missing`, `retry`, `error`). Corrected.
+- **BUG-2 (doc ↔ code, comment 3120401509)**: §15 claimed backtick
+  quotes were covered, but the four regexes only matched `'` / `"`.
+  Widened the quote-set character class to `['"`]` in `FROM_IMPORT_RE`,
+  `BARE_IMPORT_RE`, `REQUIRE_RE`, and `DYNAMIC_IMPORT_RE`, so the
+  doc claim is now accurate. Template-literal imports like
+  `` import(`lodash`) `` are extracted correctly.
+- **BUG-3 (functional, comment 3120401607)**: `FROM_IMPORT_RE`'s middle
+  section excluded `\n`, which silently dropped every multi-line
+  destructured import — the shape LLMs emit most often. The
+  exclusion class is now `[^'"`;]*?` instead of `[^'"\n;]*?`; the
+  `;` stop still prevents bridging across sibling import statements.
+- **Cosmetic (comment 3120401725)**: `check_envelope_with_deps` now
+  dedupes `per_file` raw specifiers so `import { a } from 'zustand';
+  import { b } from 'zustand'` surfaces `zustand` once in the model
+  feedback instead of twice.
+
+Six new regression tests pin the fixes so future refactors can't
+regress the multi-line / backtick / dedupe behaviours:
+
+- `extract_handles_multi_line_from_import`
+- `extract_handles_multi_line_export_from`
+- `extract_handles_backtick_template_literal_imports`
+- `extract_does_not_bridge_across_semicolons`
+- `guard_dedupes_per_file_raw_specifiers`
+- `guard_catches_multi_line_phantom_import_end_to_end`
+
+No API or event changes. The 21 existing `dependency_guard` tests
+all still pass.
 
 Plus the pair that Devin Review flagged on PR-C
 (`multi_byte_boundary_does_not_panic`,
