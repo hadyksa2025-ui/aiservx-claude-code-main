@@ -1432,16 +1432,154 @@ deferred to Phase 2 behind the command-risk security gate (V6 §VII.2).
 
 ### What is still TODO (intentionally deferred)
 
-- **Phase 1.B (PR-B):** `tsc --noEmit` compiler gate in
-  `<project>/.oc-titan/scratch/<uuid>/`, toolchain detection
-  (`bun x tsc` → `npx tsc` → global), retry budget
-  `MAX_COMPILE_RETRIES = 2`, promotion via `fs_ops::write_file` on
-  `CompileOk`, and new Settings toggles
-  (`compiler_gate_enabled`, `max_compile_retries`,
-  `tsc_timeout_secs`).
 - **Phase 1.C:** Dependency graph check — validate imports vs
   `package.json` before the envelope is applied (V6 §I.6).
 - **Phase 2:** `run_cmd` auto-execution under the command-risk gate.
+
+---
+
+## 14. OC-Titan Phase 1.B — Compiler gate (`tsc --noEmit`)
+
+> Status: **implemented, PR-B** on
+> `devin/1776801799-oc-titan-phase1b-tsc-gate`. Phase 1.B wraps the
+> Phase 1.A envelope pipeline with an isolated TypeScript compile
+> before files ever reach the real project tree. Satisfies V6 §I.5
+> ("Compiler Gate — mandatory") and V6 §V.2 ("Compiler loop — fix
+> all TypeScript errors automatically").
+
+### Module map
+
+- `src-tauri/src/compiler_gate.rs` — the whole gate. Exports
+  `skip_policy`, `prepare_scratch`, `detect_toolchain`, `run_tsc`,
+  `diagnostics_to_feedback`, `rewrite_paths_relative`, plus the
+  `CompileOutcome` / `CompileDiagnostic` / `Scratch` / `ToolchainKind`
+  types.
+- `src-tauri/src/controller.rs::run_codegen_envelope` — the single
+  Tauri entrypoint that now drives the full lifecycle (Phase 1.A
+  JSON repair → Phase 1.B compile gate → sandbox write).
+- `src-tauri/src/settings.rs` — three new persistent toggles:
+  `compiler_gate_enabled: bool` (default `true`),
+  `max_compile_retries: u32` (default `2`),
+  `tsc_timeout_secs: u64` (default `120`).
+
+### Scratch lifecycle
+
+For every envelope that makes it past Phase 1.A **and** trips
+`skip_policy` (gate enabled + at least one `.ts`/`.tsx`/`.mts`/`.cts`
+file), the gate:
+
+1. Creates `<project>/.oc-titan/scratch/<uuid>/` and appends
+   `/.oc-titan/` to `.gitignore` idempotently.
+2. Copies `tsconfig*.json` + `package.json` + `package-lock.json` /
+   `bun.lock` from the project root into the scratch dir (so the
+   user's `tsc` config — `strict`, `moduleResolution`, `lib`, etc. —
+   is honoured).
+3. Symlinks `<project>/node_modules` into the scratch dir on Unix
+   (Windows skips the symlink silently — the gate still runs, it just
+   relies on whatever `tsc` can resolve without it).
+4. Writes the envelope files into the scratch tree **before** they
+   are written to the real project. This is the whole point: the
+   model's output never pollutes the project sandbox unless `tsc`
+   accepts it.
+5. On any outcome (success, failure, timeout), the `Scratch` guard's
+   `cleanup()` is awaited. `cleanup` refuses to delete anything that
+   is not under `.oc-titan/scratch/` — defence-in-depth against a
+   corrupted scratch path.
+
+### Toolchain detection (V6 §I.5)
+
+`detect_toolchain` probes sequentially with a 5 s timeout per probe:
+
+1. `bun --version` — used only if `bun.lock` exists in the project
+   root (avoids launching bun against non-bun projects). Invoked as
+   `bun x tsc --noEmit -p <scratch>`.
+2. `npx --version` **and** `node_modules/typescript` present in the
+   project — invoked as `npx --no-install tsc --noEmit -p <scratch>`.
+3. Global `tsc --version` — invoked as `tsc --noEmit -p <scratch>`.
+   Emits an `ai:step` warning because a global `tsc` can drift from
+   the project's declared version.
+
+If no toolchain is found the controller emits a `compiler.skipped`
+event with `reason: "no_toolchain"` and promotes the envelope as-is.
+This preserves Phase 1.A behaviour on machines without a TypeScript
+toolchain — the gate is a hard *upgrade*, never a hard *downgrade*.
+
+### Outcome → action matrix
+
+| `CompileOutcome` | Controller action | `ai:step` events emitted |
+|---|---|---|
+| `Ok` | Promote envelope | `compiler.ok`, `compiler.promoted` |
+| `Errors` (attempt < max) | Reprompt executor with diagnostics | `compiler.errors`, `compiler.retry` |
+| `Errors` (attempt == max) | Return `Err` to caller | `compiler.errors` |
+| `Timeout` | Return `Err` — never retry | `compiler.timeout` |
+| `skip_policy` hit | Promote envelope | `compiler.skipped` |
+
+Max attempts = `settings.max_compile_retries + 1` (default = 3
+total: one fresh + two retries). The repair prompt sent to the model
+is built by `controller::build_compile_feedback_prompt` and contains
+the **original** user request plus a bulleted diagnostic list keyed
+by `path(line,col) TSxxxx: message`. Paths are rewritten through
+`rewrite_paths_relative` first, so the model sees
+`src/app.ts(12,4): TS2345: …` instead of the scratch UUID.
+
+### Diagnostic parsing
+
+`tsc --pretty false` is regex-parsed against:
+
+```
+(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.*)
+```
+
+Continuation lines (those that don't match the header pattern) are
+appended to the previous diagnostic's `message`, so multi-line
+diagnostics like `error TS2322: Type 'X' is not assignable to type
+'Y'. Types of property 'z' are incompatible.` survive as a single
+entry. The feedback list is capped at 50 diagnostics with a
+`… (N more truncated)` suffix to bound prompt size.
+
+### Error semantics (Devin Review follow-up)
+
+Two bugs surfaced by Devin Review on PR-A are fixed in the same PR
+as Phase 1.B (both live in the same codegen path):
+
+1. **`tool_choice: "required"`** in `ai::stream_openrouter` reverted
+   to `"auto"`. The executor loop's terminate condition is "model
+   returns zero tool calls", which `"required"` forbids; it was
+   causing the loop to exhaust `max_iterations` with an empty
+   assistant message. Deterministic-output enforcement now lives
+   *only* in `JsonMode::CodegenEnvelope` + the envelope validator,
+   not in `tool_choice`.
+2. **Partial-commit invariant.** `run_codegen_envelope` now checks
+   `result.failed` after `apply_codegen_envelope` and returns
+   `Err(..)` with a per-file failure summary whenever anything was
+   rejected by the sandbox. `AppliedEnvelope` still carries the
+   partial `applied` list for telemetry, but the UI never sees a
+   silent partial-write success.
+
+### Events (Terminal Authority, V6 §VI.1)
+
+Every compile lifecycle transition emits a structured `ai:step`:
+
+| `label` | `status` | Always carries | Context |
+|---|---|---|---|
+| `compiler.scratch_ready` | `running` | `attempt`, `uuid`, `dir` | After `prepare_scratch` |
+| `compiler.running` | `running` | `attempt`, `toolchain`, `timeout_secs` | Before `run_tsc` |
+| `compiler.ok` | `done` | `attempt`, `toolchain` | Compile succeeded |
+| `compiler.errors` | `failed` | `attempt`, `toolchain`, `diagnostic_count`, `diagnostics` | Compile failed |
+| `compiler.retry` | `running` | `attempt`, `max_attempts` | Before the next envelope turn |
+| `compiler.timeout` | `failed` | `attempt`, `toolchain`, `after_secs` | Timeout tripped |
+| `compiler.skipped` | `done` | `reason`, `attempt` | Gate disabled / no ts files / no toolchain |
+| `compiler.promoted` | `done` | `files`, `run_cmd` | After `apply_codegen_envelope` succeeded |
+| `compiler.scratch_failed` | `failed` | `reason` | `prepare_scratch` errored |
+
+### Unit tests
+
+`cargo test --lib compiler_gate` covers 12 cases, grouped by
+responsibility: TypeScript-file detection, skip policy (toggle + no
+ts), diagnostic parsing (canonical, empty, continuation lines),
+feedback formatting (empty + stable), path rewriting (strips scratch
+UUID), scratch operations (writes + gitignore), and cleanup safety
+(refuses outside scratch).
 
 ---
 

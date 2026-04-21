@@ -23,6 +23,7 @@ use tracing::warn;
 
 use crate::ai::{self, UiMessage};
 use crate::codegen_envelope::{CodegenEnvelope, EnvelopeFile};
+use crate::compiler_gate::{self, CompileOutcome};
 use crate::fs_ops;
 use crate::project_scan;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
@@ -1107,8 +1108,17 @@ pub struct AppliedFile {
 
 /// Outcome of applying a validated envelope to disk. `failed` is
 /// non-empty iff one or more files could not be written (e.g. sandbox
-/// resolve rejected a path). Callers should treat a non-empty `failed`
-/// as a hard failure — Phase 1.A does not partially commit.
+/// resolve rejected a path).
+///
+/// ### Partial commits
+///
+/// `apply_codegen_envelope` writes files sequentially. If file N of M
+/// is rejected by the sandbox, files `1..N` are already on disk when
+/// the `failed` entry is recorded. The outer Tauri command
+/// [`run_codegen_envelope`] treats any non-empty `failed` as a hard
+/// error and returns `Err(..)` so the UI never silently accepts a
+/// partially-written project. The struct still carries the partial
+/// `applied` list for telemetry / rollback tooling.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppliedEnvelope {
     pub applied: Vec<AppliedFile>,
@@ -1194,10 +1204,51 @@ pub fn apply_codegen_envelope(
     }
 }
 
-/// Tauri command: run a single codegen envelope turn end-to-end and, on
-/// success, land files into the project sandbox. The JSON-schema /
-/// retry path is owned by [`ai::run_codegen_envelope_turn`]; this
-/// command is the thin wire-level entrypoint the UI binds to.
+/// Build the executor-facing reprompt when the compiler gate has
+/// rejected the previous envelope. Keeps the framing consistent with
+/// the JSON-repair reprompt in `run_codegen_envelope_turn` — the
+/// model sees both the original request and a bulleted diagnostic
+/// list keyed by `path(line,col) TSxxxx: message`.
+fn build_compile_feedback_prompt(
+    original_request: &str,
+    diagnostics_feedback: &str,
+) -> String {
+    format!(
+        "{original_request}\n\n\
+         [compiler gate] Your previous envelope compiled cleanly against \
+         the JSON schema but failed `tsc --noEmit` in an isolated scratch \
+         directory. The full list of TypeScript diagnostics:\n\
+         {diagnostics_feedback}\n\n\
+         Emit a NEW, complete codegen envelope that fixes all of these \
+         errors. Every `path` must still be sandbox-relative and every \
+         `content` must contain the FULL file contents. Re-emit files \
+         you already sent even if only one line changes."
+    )
+}
+
+/// Tauri command: run a full codegen envelope lifecycle and, on
+/// success, land files into the project sandbox.
+///
+/// Lifecycle (Phase 1.A + Phase 1.B):
+///
+/// 1. [`ai::run_codegen_envelope_turn`] — JSON-schema validated
+///    envelope with one repair retry (V6 §V.1).
+/// 2. [`compiler_gate::skip_policy`] — skip the compile gate when
+///    disabled in settings or when the envelope has no `.ts` / `.tsx`
+///    files (HTML-only / JSON-only envelopes pay zero cost).
+/// 3. [`compiler_gate::prepare_scratch`] — materialise the envelope
+///    into `<project>/.oc-titan/scratch/<uuid>/` with copied tsconfig
+///    and a `node_modules` symlink.
+/// 4. [`compiler_gate::run_tsc`] — `tsc --noEmit` on the scratch dir
+///    with a bounded timeout.
+/// 5. On `CompileOutcome::Errors` the controller reprompts the model
+///    with the structured diagnostics and loops up to
+///    `settings.max_compile_retries` additional attempts (V6 §V.2).
+/// 6. On `CompileOutcome::Ok` or `Skipped` the envelope is promoted
+///    via [`apply_codegen_envelope`], which writes through
+///    [`fs_ops::write_file`] (sandbox check, defence-in-depth).
+/// 7. Any non-empty `failed` list is converted to an `Err` — the UI
+///    never receives a silent partial commit.
 ///
 /// Phase 1 surfaces `run_cmd` on the returned payload but does NOT
 /// execute it — that is deferred to Phase 2 behind the command-risk
@@ -1211,14 +1262,239 @@ pub async fn run_codegen_envelope(
     history: Vec<UiMessage>,
     autonomous_confirm: bool,
 ) -> Result<AppliedEnvelope, String> {
-    let turn = ai::run_codegen_envelope_turn(
-        app.clone(),
-        state.inner(),
-        project_dir.clone(),
-        user_request,
-        history,
-        autonomous_confirm,
-    )
-    .await?;
-    Ok(apply_codegen_envelope(&app, &project_dir, &turn.envelope))
+    let (gate_enabled, max_compile_retries, tsc_timeout_secs) = {
+        let s = state.read_settings();
+        (
+            s.compiler_gate_enabled,
+            s.max_compile_retries,
+            s.tsc_timeout_secs,
+        )
+    };
+
+    let original_request = user_request.clone();
+    let mut current_request = user_request;
+    let mut last_diagnostics: Option<String> = None;
+    let max_attempts = max_compile_retries.saturating_add(1);
+    let mut applied_envelope: Option<CodegenEnvelope> = None;
+
+    for attempt in 0..max_attempts {
+        let turn = ai::run_codegen_envelope_turn(
+            app.clone(),
+            state.inner(),
+            project_dir.clone(),
+            current_request.clone(),
+            history.clone(),
+            autonomous_confirm,
+        )
+        .await?;
+
+        if let Some(reason) = compiler_gate::skip_policy(gate_enabled, &turn.envelope) {
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "compiler",
+                    "label": "compiler.skipped",
+                    "status": "done",
+                    "reason": reason,
+                    "attempt": attempt,
+                }),
+            );
+            applied_envelope = Some(turn.envelope);
+            break;
+        }
+
+        let scratch = match compiler_gate::prepare_scratch(&project_dir, &turn.envelope).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.scratch_failed",
+                        "status": "failed",
+                        "reason": e,
+                    }),
+                );
+                return Err(format!("compiler gate could not prepare scratch: {e}"));
+            }
+        };
+        let _ = app.emit(
+            "ai:step",
+            json!({
+                "role": "compiler",
+                "label": "compiler.scratch_ready",
+                "status": "running",
+                "attempt": attempt,
+                "uuid": scratch.uuid,
+                "dir": scratch.dir.display().to_string(),
+            }),
+        );
+
+        let project_path = std::path::Path::new(&project_dir);
+        let toolchain = match compiler_gate::detect_toolchain(project_path).await {
+            Some(t) => t,
+            None => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.skipped",
+                        "status": "done",
+                        "reason": "no_toolchain",
+                        "attempt": attempt,
+                    }),
+                );
+                // Best-effort cleanup, then promote anyway. This
+                // matches the skip_policy contract — the user has no
+                // tsc available, so the gate is a no-op.
+                let _ = scratch.cleanup().await;
+                applied_envelope = Some(turn.envelope);
+                break;
+            }
+        };
+
+        let _ = app.emit(
+            "ai:step",
+            json!({
+                "role": "compiler",
+                "label": "compiler.running",
+                "status": "running",
+                "attempt": attempt,
+                "toolchain": toolchain.as_str(),
+                "timeout_secs": tsc_timeout_secs,
+            }),
+        );
+
+        let outcome = compiler_gate::run_tsc(&scratch, toolchain, tsc_timeout_secs).await;
+
+        match outcome {
+            CompileOutcome::Ok { .. } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.ok",
+                        "status": "done",
+                        "attempt": attempt,
+                        "toolchain": toolchain.as_str(),
+                    }),
+                );
+                let _ = scratch.cleanup().await;
+                applied_envelope = Some(turn.envelope);
+                break;
+            }
+            CompileOutcome::Timeout {
+                toolchain: tc,
+                after_secs,
+            } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.timeout",
+                        "status": "failed",
+                        "attempt": attempt,
+                        "toolchain": tc.as_str(),
+                        "after_secs": after_secs,
+                    }),
+                );
+                let _ = scratch.cleanup().await;
+                return Err(format!(
+                    "compiler gate: `tsc --noEmit` exceeded {after_secs}s timeout on attempt {attempt}"
+                ));
+            }
+            CompileOutcome::Errors {
+                toolchain: tc,
+                mut diagnostics,
+                raw_output,
+            } => {
+                compiler_gate::rewrite_paths_relative(&mut diagnostics, &scratch.uuid);
+                let feedback = compiler_gate::diagnostics_to_feedback(&diagnostics);
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.errors",
+                        "status": "failed",
+                        "attempt": attempt,
+                        "toolchain": tc.as_str(),
+                        "diagnostic_count": diagnostics.len(),
+                        "diagnostics": diagnostics,
+                    }),
+                );
+                let _ = scratch.cleanup().await;
+
+                last_diagnostics = Some(feedback.clone());
+                if attempt + 1 >= max_attempts {
+                    warn!(
+                        "compiler gate exhausted retries after {attempt} attempt(s); raw tsc output was: {}",
+                        truncate_for_log(&raw_output)
+                    );
+                    return Err(format!(
+                        "compiler gate: tsc reported {} error(s) after {} attempt(s):\n{feedback}",
+                        diagnostics.len(),
+                        attempt + 1,
+                    ));
+                }
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "compiler",
+                        "label": "compiler.retry",
+                        "status": "running",
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                    }),
+                );
+                current_request = build_compile_feedback_prompt(&original_request, &feedback);
+            }
+        }
+    }
+
+    let envelope = applied_envelope
+        .ok_or_else(|| "compiler gate: exited loop without promoting an envelope".to_string())?;
+
+    let result = apply_codegen_envelope(&app, &project_dir, &envelope);
+    if !result.failed.is_empty() {
+        let summary = result
+            .failed
+            .iter()
+            .map(|(p, e)| format!("- {p}: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "codegen envelope partially failed: {}/{} files could not be written:\n{summary}",
+            result.failed.len(),
+            result.failed.len() + result.applied.len()
+        ));
+    }
+    let _ = app.emit(
+        "ai:step",
+        json!({
+            "role": "compiler",
+            "label": "compiler.promoted",
+            "status": "done",
+            "files": result.applied.len(),
+            "run_cmd": result.run_cmd,
+        }),
+    );
+    // `last_diagnostics` is retained for future telemetry sinks — it
+    // contains the most recent successful-repair feedback, which is
+    // useful for post-mortem / failure-memory aggregation (V6 §III.1).
+    let _ = last_diagnostics;
+    Ok(result)
+}
+
+/// Truncate a long tsc output for log lines so a catastrophic compile
+/// failure does not flood the trace. 4 KiB keeps enough context to
+/// diagnose issues without blowing up log storage.
+fn truncate_for_log(s: &str) -> String {
+    const MAX: usize = 4096;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        let mut out = s[..MAX].to_string();
+        out.push_str(&format!("… ({} bytes truncated)", s.len() - MAX));
+        out
+    }
 }

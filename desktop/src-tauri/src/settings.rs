@@ -145,6 +145,25 @@ pub struct Settings {
     /// project. Scenario-A §9.2 F-8.
     #[serde(default)]
     pub last_project_dir: Option<String>,
+    /// OC-Titan Phase 1.B — enable the TypeScript compiler gate
+    /// (`tsc --noEmit`) that validates every codegen envelope in a
+    /// scratch dir before files are promoted into the real project.
+    /// Default `true` — the gate silently skips envelopes that touch
+    /// no `.ts` / `.tsx` files, so HTML-only / JSON-only envelopes
+    /// (e.g. L1 prompts in OPENROUTER_VALIDATION_REPORT) pay no cost.
+    #[serde(default = "default_true")]
+    pub compiler_gate_enabled: bool,
+    /// How many corrective retries the compiler gate will attempt when
+    /// `tsc` reports errors before it gives up and surfaces the
+    /// diagnostics to the UI. V6 §V.2 sets this to 2 by default.
+    #[serde(default = "default_max_compile_retries")]
+    pub max_compile_retries: u32,
+    /// Wall-clock timeout for a single `tsc --noEmit` invocation, in
+    /// seconds. 0 disables the timeout. Defaults to 120s, which is
+    /// generous for typical SPA scratches and still bounds the
+    /// worst-case case where `tsc` loops on a pathological input.
+    #[serde(default = "default_tsc_timeout_secs")]
+    pub tsc_timeout_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -180,6 +199,15 @@ fn default_circuit_breaker_threshold() -> u32 {
 }
 fn default_max_parallel_tasks() -> u32 {
     1
+}
+fn default_max_compile_retries() -> u32 {
+    // V6 §V.2 Compiler loop — two corrective retries per envelope.
+    // Keeps deterministic bounds while giving the model a second pass
+    // after its initial fix attempt.
+    2
+}
+fn default_tsc_timeout_secs() -> u64 {
+    120
 }
 fn default_context_compaction_keep_last() -> u32 {
     // 20 UI messages ≈ 10 user/assistant pairs. Comfortable for
@@ -241,6 +269,9 @@ impl Default for Settings {
             context_compaction_enabled: false,
             context_compaction_keep_last: default_context_compaction_keep_last(),
             last_project_dir: None,
+            compiler_gate_enabled: true,
+            max_compile_retries: default_max_compile_retries(),
+            tsc_timeout_secs: default_tsc_timeout_secs(),
         }
     }
 }

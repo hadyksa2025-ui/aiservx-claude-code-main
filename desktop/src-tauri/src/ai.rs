@@ -557,15 +557,19 @@ async fn stream_openrouter(
         body["response_format"] = json!({ "type": "json_object" });
     } else if let Some(schema) = tools_schema {
         body["tools"] = schema.clone();
-        // V6 §I.1 / §VII.3 — audit (OPENROUTER_VALIDATION_REPORT §8.6)
-        // flagged "tool_choice: auto" on turns that ship a tool schema
-        // as the root cause for Flash-class models ignoring the tools
-        // array entirely. Upgrade to "required" so that any turn which
-        // explicitly ships tools MUST resolve through one of them —
-        // pure-text reasoning turns never carry a schema in the first
-        // place (reviewer/planner pass `None`), so they continue to
-        // use the model's default free-form behaviour.
-        body["tool_choice"] = json!("required");
+        // `tool_choice: "auto"` is the only value that lets the
+        // executor loop terminate: the loop at `run_chat_turn` breaks
+        // when the model returns zero tool calls, and `"required"`
+        // forbids that. V6 §I.1 / OPENROUTER_VALIDATION_REPORT §8.6
+        // flagged Flash-class models occasionally ignoring tools under
+        // `"auto"`, but the fix for *that* lives in Phase 1.A:
+        // deterministic-output turns now run through
+        // [`JsonMode::CodegenEnvelope`] (no tool schema at all) and
+        // are enforced by the envelope validator + repair loop, not
+        // by `tool_choice`. Pure tool-calling executor turns therefore
+        // keep the original `"auto"` contract so they can finish
+        // cleanly once no more tools are needed.
+        body["tool_choice"] = json!("auto");
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
