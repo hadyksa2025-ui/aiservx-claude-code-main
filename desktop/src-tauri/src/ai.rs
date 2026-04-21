@@ -42,8 +42,41 @@ use tauri::{AppHandle, Emitter};
 use tracing::warn;
 
 use crate::cancel::CancelToken;
+use crate::codegen_envelope::{self, CodegenEnvelope};
 use crate::settings::ProviderMode;
 use crate::{memory, tools, AppState, Settings};
+
+/// JSON-output mode for a model turn (Phase 1.A, V6 §I.1).
+///
+/// Replaces the previous boolean flag and lets the dispatcher
+/// distinguish between:
+/// - [`JsonMode::Off`]: normal free-form prose + optional tool calls
+///   (default for `send_chat`, autonomous executor, reviewer).
+/// - [`JsonMode::PlannerPlan`]: goal-planner JSON (`{ "tasks": [...] }`).
+///   Enforced at the provider level (`response_format: json_object` on
+///   OpenRouter, `format: json` on Ollama) but shape is checked by the
+///   caller (`controller::parse_plan_json`).
+/// - [`JsonMode::CodegenEnvelope`]: strict multi-file envelope
+///   (`{ files: [...], run_cmd? }`) validated against
+///   `schemas/codegen_envelope.json`. Tool schema is dropped for this
+///   mode — the executor must emit the envelope as its final answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonMode {
+    Off,
+    PlannerPlan,
+    CodegenEnvelope,
+}
+
+impl JsonMode {
+    /// True when the provider must be told to constrain output to a
+    /// JSON object (`response_format: json_object` /
+    /// `format: "json"`). In both JSON sub-modes we also drop the tool
+    /// schema — models that accept both simultaneously are rare, and
+    /// neither the planner nor the codegen turn needs tools.
+    fn is_json(self) -> bool {
+        !matches!(self, JsonMode::Off)
+    }
+}
 
 // Hard caps that protect the UI from runaway behavior even if the model
 // gets stuck in a tool loop. `Settings::max_iterations` can tighten this
@@ -499,7 +532,7 @@ async fn stream_openrouter(
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
     role: Role,
-    json_mode: bool,
+    json_mode: JsonMode,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     if cancel.is_cancelled() {
@@ -513,17 +546,26 @@ async fn stream_openrouter(
         "messages": messages,
         "stream": true,
     });
-    // `json_mode` forces the model to return a valid JSON object. It is
-    // intended for the goal planner (see `plan_goal`), where the
-    // downstream code does strict `serde_json` parsing. When json mode
-    // is on we skip tool schemas entirely: not every OpenRouter model
-    // accepts `response_format` + `tools` simultaneously, and the goal
-    // planner is pure text-in / JSON-out — no tools are needed.
-    if json_mode {
+    // `json_mode` forces the model to return a valid JSON object.
+    // Applies to the goal planner ([`JsonMode::PlannerPlan`]) and to
+    // codegen-envelope turns ([`JsonMode::CodegenEnvelope`], V6 §I.1).
+    // When json mode is on we skip tool schemas entirely: not every
+    // OpenRouter model accepts `response_format` + `tools`
+    // simultaneously, and neither the planner nor the codegen turn
+    // needs tools.
+    if json_mode.is_json() {
         body["response_format"] = json!({ "type": "json_object" });
     } else if let Some(schema) = tools_schema {
         body["tools"] = schema.clone();
-        body["tool_choice"] = json!("auto");
+        // V6 §I.1 / §VII.3 — audit (OPENROUTER_VALIDATION_REPORT §8.6)
+        // flagged "tool_choice: auto" on turns that ship a tool schema
+        // as the root cause for Flash-class models ignoring the tools
+        // array entirely. Upgrade to "required" so that any turn which
+        // explicitly ships tools MUST resolve through one of them —
+        // pure-text reasoning turns never carry a schema in the first
+        // place (reviewer/planner pass `None`), so they continue to
+        // use the model's default free-form behaviour.
+        body["tool_choice"] = json!("required");
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
@@ -683,7 +725,7 @@ async fn stream_ollama(
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
     role: Role,
-    json_mode: bool,
+    json_mode: JsonMode,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     if cancel.is_cancelled() {
@@ -697,10 +739,11 @@ async fn stream_ollama(
     });
     // Ollama's native JSON-output constraint. Same semantics as
     // OpenRouter's `response_format: json_object` — forces a valid JSON
-    // object on output. We also drop the tool schema when json mode is
-    // on, both to match OpenRouter's behaviour and because the goal
-    // planner does not need tools.
-    if json_mode {
+    // object on output. Applies to both [`JsonMode::PlannerPlan`] and
+    // [`JsonMode::CodegenEnvelope`] (V6 §I.1). We also drop the tool
+    // schema when json mode is on to match OpenRouter's behaviour and
+    // because neither the planner nor the codegen turn needs tools.
+    if json_mode.is_json() {
         body["format"] = json!("json");
     } else if let Some(schema) = tools_schema {
         body["tools"] = schema.clone();
@@ -799,7 +842,7 @@ async fn call_model(
     role: Role,
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
-    json_mode: bool,
+    json_mode: JsonMode,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     let (primary, fallback) = resolve_provider(settings, role);
@@ -892,7 +935,7 @@ async fn call_provider(
     role: Role,
     messages: &[WireMessage],
     tools_schema: Option<&Value>,
-    json_mode: bool,
+    json_mode: JsonMode,
     cancel: &CancelToken,
 ) -> Result<WireMessage, String> {
     match provider {
@@ -1292,9 +1335,10 @@ pub async fn send_chat(
     // Chat-driven turns never force autonomous confirms — the user is
     // already in the loop by construction, and the existing confirm
     // modal handles unfamiliar `run_cmd`s via `cmd_confirm_required`.
-    // `json_mode = false` — normal chat is free-form prose; only
-    // `plan_goal` opts into strict JSON output.
-    run_chat_turn(app, &state, project_dir, message, history, false, false).await
+    // `JsonMode::Off` — normal chat is free-form prose; only
+    // `plan_goal` and `run_codegen_envelope_turn` opt into strict JSON
+    // output.
+    run_chat_turn(app, &state, project_dir, message, history, false, JsonMode::Off).await
 }
 
 /// A chat turn's cancel scope. Run-time callers (`send_chat`,
@@ -1347,12 +1391,16 @@ pub(crate) async fn run_chat_turn(
     message: String,
     history: Vec<UiMessage>,
     autonomous_confirm: bool,
-    // When true, every model call in this turn is placed in
-    // JSON-output mode (`response_format: {type: "json_object"}` on
-    // OpenRouter, `format: "json"` on Ollama). Used by the goal
-    // planner (`controller::plan_goal`) so small local models cannot
-    // wrap the task list in prose/markdown. Off for normal chat.
-    json_mode: bool,
+    // Controls the JSON-output contract for every model call in this
+    // turn. See [`JsonMode`].
+    //
+    // - [`JsonMode::Off`]: free-form prose + optional tool calls.
+    // - [`JsonMode::PlannerPlan`]: goal-planner JSON; used by
+    //   `controller::plan_goal` so small local models cannot wrap the
+    //   task list in prose/markdown.
+    // - [`JsonMode::CodegenEnvelope`]: strict multi-file envelope
+    //   validated against `schemas/codegen_envelope.json` — V6 §I.1.
+    json_mode: JsonMode,
 ) -> Result<ChatResponse, String> {
     // Re-arm the per-turn cancel token. A prior `cancel_chat` press must
     // not poison the next turn; the controller is responsible for not
@@ -1482,11 +1530,11 @@ pub(crate) async fn run_chat_turn(
                 Role::Executor,
                 &messages,
                 // When the whole turn is in json_mode the executor
-                // is not supposed to call tools — the goal planner
-                // expects pure JSON output. Dropping the schema here
-                // matches the behaviour we negotiate with the
-                // provider in `stream_*`.
-                if json_mode { None } else { Some(&schema) },
+                // is not supposed to call tools — the planner /
+                // codegen-envelope turn expects pure JSON output.
+                // Dropping the schema here matches the behaviour we
+                // negotiate with the provider in `stream_*`.
+                if json_mode.is_json() { None } else { Some(&schema) },
                 json_mode,
                 &cancel,
             )
@@ -1537,7 +1585,7 @@ pub(crate) async fn run_chat_turn(
                 // correct behaviour there, not a capability failure.
                 // Without this guard every goal would fire a spurious
                 // warning (PR #12 Devin Review).
-                if iteration == 0 && !json_mode {
+                if iteration == 0 && !json_mode.is_json() {
                     let _ = app.emit(
                         "ai:executor_unparsed",
                         json!({
@@ -1676,7 +1724,7 @@ pub(crate) async fn run_chat_turn(
         if !settings.reviewer_enabled
             || final_assistant.is_empty()
             || reviewer_retries_left == 0
-            || json_mode
+            || json_mode.is_json()
         {
             break 'outer;
         }
@@ -1709,7 +1757,7 @@ pub(crate) async fn run_chat_turn(
             // Reviewer output is a short OK/NEEDS_FIX verdict,
             // never JSON. Always plain mode regardless of the outer
             // turn's `json_mode` flag.
-            false,
+            JsonMode::Off,
             &cancel,
         )
         .await;
@@ -1810,6 +1858,211 @@ pub(crate) async fn run_chat_turn(
         executor_iterations: executor_iterations as u32,
         trace,
     })
+}
+
+// ---------- Codegen envelope turn (Phase 1.A, V6 §I.1) ----------
+
+/// System prompt injected on [`JsonMode::CodegenEnvelope`] turns. The
+/// model must emit ONLY a validated codegen envelope as its assistant
+/// response. See `schemas/codegen_envelope.json`.
+const CODEGEN_ENVELOPE_PROMPT: &str = r#"You are in DETERMINISTIC CODEGEN mode.
+
+Your entire response MUST be a single JSON object matching this exact shape,
+with no prose, no markdown fences, and no keys other than the ones listed:
+
+{
+  "files": [
+    { "path": "<sandbox-relative POSIX path>", "content": "<full file contents>" }
+  ],
+  "run_cmd": "<optional single-line suggested command>"
+}
+
+Hard rules:
+- Do NOT wrap the response in ```json or any other fence.
+- Do NOT emit any text before or after the JSON object.
+- Every `path` MUST be sandbox-relative (no leading '/', no '..', no drive letter).
+- Every `content` MUST be the FULL file contents, never a diff or snippet.
+- `run_cmd` is optional; if included it is a single-line suggested command only —
+  it will NOT be auto-executed.
+- `files` MUST contain at least one entry and at most 256 entries.
+
+Violating any of these rules will cause your response to be rejected and
+re-requested with the exact JSON Pointer of the failing field."#;
+
+/// How many times a failed envelope validation is re-requested from the
+/// model before giving up. `1` matches V6 §V.1 (JSON repair loop) and
+/// keeps behaviour deterministic — infinite loops are an anti-pattern.
+const CODEGEN_ENVELOPE_REPAIR_RETRIES: usize = 1;
+
+/// A validated codegen envelope plus the raw assistant text and step
+/// telemetry. Callers typically apply the envelope through
+/// `controller::apply_codegen_envelope` to actually land files on disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodegenEnvelopeTurn {
+    pub envelope: CodegenEnvelope,
+    /// Verbatim assistant text that produced the envelope. Useful for
+    /// debug panes and transcripts.
+    pub raw: String,
+    /// Ordered step summaries (reuses [`StepSummary`] so the UI can
+    /// render codegen turns on the same timeline as chat turns).
+    pub steps: Vec<StepSummary>,
+}
+
+/// Run a single codegen turn that MUST produce a validated envelope.
+///
+/// Flow:
+/// 1. Call [`run_chat_turn`] with [`JsonMode::CodegenEnvelope`] so the
+///    provider is constrained to a JSON object.
+/// 2. Validate the assistant text against
+///    `schemas/codegen_envelope.json`.
+/// 3. On validation failure, emit `ai:step` telemetry and retry once
+///    ([`CODEGEN_ENVELOPE_REPAIR_RETRIES`]) with an explicit reprompt
+///    that names the violating JSON pointer.
+/// 4. On success, emit `envelope.ok` and return the envelope to the
+///    caller. Files are NOT written here — that is the caller's
+///    responsibility so the compiler gate (PR-B) can sandbox a scratch
+///    dir before promotion.
+///
+/// `autonomous_confirm` is forwarded to [`run_chat_turn`]; in practice
+/// codegen turns never call tools (the schema is dropped in json mode),
+/// so this flag mostly affects observability rather than behaviour.
+pub(crate) async fn run_codegen_envelope_turn(
+    app: AppHandle,
+    state: &AppState,
+    project_dir: String,
+    user_request: String,
+    history: Vec<UiMessage>,
+    autonomous_confirm: bool,
+) -> Result<CodegenEnvelopeTurn, String> {
+    // Inject the deterministic codegen protocol as a system prefix so
+    // the model sees it regardless of whatever prose the caller puts in
+    // `user_request`. We stitch it in as a user-visible framing because
+    // the executor's system message is already fixed — any additional
+    // guidance has to ride on the user turn.
+    let framed = format!("{CODEGEN_ENVELOPE_PROMPT}\n\nUSER REQUEST:\n{user_request}");
+
+    let _ = app.emit(
+        "ai:step",
+        json!({
+            "role": "executor",
+            "label": "codegen.envelope.request",
+            "status": "running",
+        }),
+    );
+
+    let first = run_chat_turn(
+        app.clone(),
+        state,
+        project_dir.clone(),
+        framed.clone(),
+        history.clone(),
+        autonomous_confirm,
+        JsonMode::CodegenEnvelope,
+    )
+    .await?;
+
+    match codegen_envelope::parse_and_validate(&first.assistant) {
+        Ok(envelope) => {
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "executor",
+                    "label": "codegen.envelope.ok",
+                    "status": "done",
+                    "files": envelope.files.len(),
+                }),
+            );
+            Ok(CodegenEnvelopeTurn {
+                envelope,
+                raw: first.assistant,
+                steps: first.steps,
+            })
+        }
+        Err(err) => {
+            let feedback = err.to_feedback();
+            warn!(
+                "codegen envelope violated schema on first attempt: {}",
+                truncate(&feedback, 400)
+            );
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "executor",
+                    "label": "codegen.envelope.violation",
+                    "status": "failed",
+                    "feedback": feedback,
+                }),
+            );
+            // Single repair attempt. More aggressive retry is the job
+            // of the outer self-heal loop (compile gate, PR-B).
+            if CODEGEN_ENVELOPE_REPAIR_RETRIES == 0 {
+                return Err(format!(
+                    "codegen envelope did not match schema and no repair retries are configured:\n{feedback}"
+                ));
+            }
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "executor",
+                    "label": "codegen.envelope.retry",
+                    "status": "running",
+                    "attempt": 1,
+                }),
+            );
+            let reprompt = format!(
+                "{framed}\n\nYour previous response did not match the codegen \
+                 envelope schema. The exact violations (JSON Pointer: reason):\n\
+                 {feedback}\n\n\
+                 Re-emit the ENTIRE response as a single valid envelope \
+                 object. No prose, no fences, no extra keys."
+            );
+            let second = run_chat_turn(
+                app.clone(),
+                state,
+                project_dir,
+                reprompt,
+                history,
+                autonomous_confirm,
+                JsonMode::CodegenEnvelope,
+            )
+            .await?;
+            match codegen_envelope::parse_and_validate(&second.assistant) {
+                Ok(envelope) => {
+                    let _ = app.emit(
+                        "ai:step",
+                        json!({
+                            "role": "executor",
+                            "label": "codegen.envelope.ok",
+                            "status": "done",
+                            "files": envelope.files.len(),
+                            "repaired": true,
+                        }),
+                    );
+                    Ok(CodegenEnvelopeTurn {
+                        envelope,
+                        raw: second.assistant,
+                        steps: second.steps,
+                    })
+                }
+                Err(err2) => {
+                    let feedback2 = err2.to_feedback();
+                    let _ = app.emit(
+                        "ai:step",
+                        json!({
+                            "role": "executor",
+                            "label": "codegen.envelope.violation",
+                            "status": "failed",
+                            "attempt": 2,
+                            "feedback": feedback2,
+                        }),
+                    );
+                    Err(format!(
+                        "codegen envelope still invalid after {CODEGEN_ENVELOPE_REPAIR_RETRIES} repair attempt(s):\n{feedback2}"
+                    ))
+                }
+            }
+        }
+    }
 }
 
 // ---------- Helpers ----------

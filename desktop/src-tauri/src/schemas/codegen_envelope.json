@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oc-titan.local/schemas/codegen_envelope.json",
+  "title": "OC-Titan codegen envelope",
+  "description": "Deterministic multi-file output contract for any turn that generates project files. See PROJECT_MEMORY.md and docs/OC_TITAN_PHASE1_PLAN.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["files"],
+  "properties": {
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "content"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "POSIX-style, sandbox-relative path. Must NOT start with '/' or contain NUL bytes; backward '..' traversal is rejected by fs_ops::resolve at apply time.",
+            "pattern": "^(?!/)[^\\u0000]+$"
+          },
+          "content": {
+            "type": "string",
+            "description": "Full file contents. No markdown fences, no partial snippets.",
+            "maxLength": 4194304
+          }
+        }
+      }
+    },
+    "run_cmd": {
+      "type": "string",
+      "description": "Optional single-line suggested run command. Phase 1: captured and surfaced only, NEVER auto-executed.",
+      "maxLength": 2048
+    }
+  }
+}
