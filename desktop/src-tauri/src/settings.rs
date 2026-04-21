@@ -186,6 +186,26 @@ pub struct Settings {
     /// legitimately lags the code.
     #[serde(default = "default_dependency_guard_mode")]
     pub dependency_guard_mode: String,
+    /// OC-Titan Phase 2.A — enable the deterministic `run_cmd`
+    /// security classifier (V6 §VII.2). When on, every envelope's
+    /// `run_cmd` is classified as SAFE / WARNING / DANGEROUS after the
+    /// compiler gate succeeds and a `security.classified` `ai:step`
+    /// event is emitted so the UI can surface the risk. This setting
+    /// does not itself enable execution of `run_cmd` — that is
+    /// deferred to Phase 2.B behind the same classifier. Defaults to
+    /// enabled because the event is informational only.
+    #[serde(default = "default_true")]
+    pub security_gate_enabled: bool,
+    /// Behaviour of the Phase 2.B execution layer (not yet wired) when
+    /// the classifier returns WARNING: `"prompt"` routes the command
+    /// through the existing confirm modal, `"allow"` auto-approves
+    /// (matches today's allow-list behaviour for low-friction
+    /// workflows), `"block"` refuses outright. Dangerous is always
+    /// blocked and Safe is always allowed regardless of this setting.
+    /// Phase 2.A reads and persists this value but does not yet act
+    /// on it; Phase 2.B will consume it.
+    #[serde(default = "default_security_gate_warning_mode")]
+    pub security_gate_warning_mode: String,
 }
 
 fn default_true() -> bool {
@@ -237,6 +257,13 @@ fn default_dependency_guard_mode() -> String {
     // retry slot on them. Users can relax this to `"warn"` from
     // Settings when bootstrapping a new project.
     "fail".to_string()
+}
+fn default_security_gate_warning_mode() -> String {
+    // V6 §VII.2 — WARNING commands should require an explicit
+    // human-in-the-loop decision by default. Phase 2.B will honour
+    // this, but we persist the value now so users' preferences
+    // survive across sessions before execution is wired up.
+    "prompt".to_string()
 }
 fn default_context_compaction_keep_last() -> u32 {
     // 20 UI messages ≈ 10 user/assistant pairs. Comfortable for
@@ -303,6 +330,8 @@ impl Default for Settings {
             tsc_timeout_secs: default_tsc_timeout_secs(),
             dependency_guard_enabled: true,
             dependency_guard_mode: default_dependency_guard_mode(),
+            security_gate_enabled: true,
+            security_gate_warning_mode: default_security_gate_warning_mode(),
         }
     }
 }

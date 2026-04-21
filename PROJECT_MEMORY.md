@@ -1908,5 +1908,253 @@ assert the surviving chars instead of short-circuiting at
 
 ---
 
+## 16. OC-Titan Phase 2.A — `run_cmd` security classifier (V6 §VII.2)
+
+Phase 2.A introduces a **deterministic** three-tier risk classifier
+for the `run_cmd` field that codegen envelopes optionally surface
+(Phase 1.A, §13). The classifier is *pure*: same input always returns
+the same `Classification`, with no filesystem / network / LLM
+side-effects. It's the foundation every future execution layer
+(Phase 2.B, 2.C) will consume, so the rules live in one place that
+the UI, executor, auto-install flow, and telemetry aggregator can
+all call.
+
+Phase 2.A is **classification only** — nothing is executed. The
+existing AI-tool-loop command gate
+(`tools::should_prompt_run_cmd` + `tools::deny_reason`) is left
+intact; Phase 2.B will migrate it onto the classifier in a separate
+PR so scope stays small.
+
+### §16.1 Module map (new file)
+
+- [`desktop/src-tauri/src/security_gate.rs`](desktop/src-tauri/src/security_gate.rs)
+  — ~720 LoC incl. 17 unit tests. Three public items:
+  - `pub enum SecurityClass { Safe, Warning, Dangerous }` — ordered
+    (`Dangerous > Warning > Safe`) so callers can take `max(…)` of
+    multiple classifications if needed.
+  - `pub struct Classification { class, reason, matched_rule,
+    compound }` — serialised verbatim to the UI. `matched_rule` is a
+    stable string id (`dangerous.rm_rf_root`, `safe.pkg_builtin`,
+    `unknown`) suitable for telemetry aggregation; `reason` is the
+    human-readable explanation shown in `ai:step`.
+  - `pub fn classify(cmd: &str) -> Classification` — the entry
+    point.
+
+### §16.2 Classification order (terminal on first match)
+
+1. **Dangerous** — destructive / privileged / out-of-sandbox patterns.
+   Preserves every substring from `tools::deny_reason` and adds the
+   V6 §VII.2 extras:
+   - `rm -rf /`, `rm -rf /*`, `rm -rf ~`, `rm -rf $HOME`
+   - `mkfs`, `fdisk`, `dd of=/dev/…`
+   - `:(){ :|:& };:` fork bomb variants
+   - `sudo`, `doas`
+   - `chown -R /`, `chmod -R 777 /`, `chmod 777 /`
+   - `>/dev/sda`, `>/dev/sdb`, `>/dev/nvme…`
+   - `> /etc/…`, `>> /etc/…`, `> /boot/…`
+   - `git push --force`, `git push -f`, `git push --force-with-lease`
+   - `git reset --hard`
+   - `git clean -fd`, `git clean -fdx`, `git clean -df`
+   - `curl … | sh` / `wget … | bash` / `… | zsh` / `… | fish`
+2. **Warning** — state-changing but reversible:
+   - Package installs: `npm / pnpm i|install|add|uninstall|remove`,
+     `bun i|install|add|remove`, `yarn add|install|remove`,
+     `pip install|uninstall`, `cargo add|install|update`, `go get`
+   - Git writes: `commit`, `push` (non-force), `checkout`, `merge`,
+     `pull`, `rebase`, `cherry-pick`, `revert`, `tag`, `stash`,
+     `apply`, `am`, `fetch`; `branch -D / --delete`
+   - FS writes: `mkdir`, `touch`, `mv`, `cp`, `ln`, `rm <file>`
+     (non-recursive, non-root)
+   - Formatters with writes: `prettier --write`, `eslint --fix`,
+     `rustfmt`, `cargo fmt`
+   - DB migrations: `prisma`, `drizzle-kit`, `typeorm`, `knex`,
+     `sequelize`, `alembic`, `rake db:*`
+   - Containers / services: `docker run|exec|build|rm|rmi|pull|push|compose`,
+     `systemctl`, `service`, `launchctl`
+3. **Safe** — read-only / idempotent / local build:
+   - `npm / pnpm / yarn / bun run <script>` where `<script>` is in
+     the known-safe allow-list: `dev, start, serve, preview, build,
+     build:prod, compile, typecheck, tsc, lint, check, test, tests,
+     format:check, fmt:check, prepack`
+   - `npm|pnpm|yarn|bun test` / `npm|pnpm|yarn|bun build` (built-in
+     shortcuts; no `$` anchor so compound-escalation still identifies
+     the base rule — see §16.4)
+   - `tsc --noEmit`, `npx tsc --noEmit`, `bun x tsc --noEmit`,
+     `pnpm exec tsc --noEmit`
+   - `cargo check|build|test|clippy|tree|metadata|doc|bench`,
+     `cargo fmt --check`, `cargo fmt -- --check`
+   - Git read: `status`, `diff`, `log`, `show`, `remote -v`,
+     `ls-files`, `describe`, `reflog`, `rev-parse`, `blame`,
+     `shortlog`, `branch` (list forms)
+   - POSIX read: `ls`, `pwd`, `whoami`, `date`, `uname`, `which`,
+     `file`, `wc`, `head`, `tail`, `cat`, `echo`, `printf`, `env`,
+     `hostname`, `uptime`, `id`, `stat`, `du`, `df`, `type`
+   - `grep`, `find` (minus `-delete / -exec / -execdir / -ok /
+     -okdir`)
+   - Direct script exec: `node foo.mjs`, `bun tool.ts`, `python3
+     gen.py`, etc.
+   - Package manager listing: `npm|pnpm|yarn|bun ls|list|info|view|
+     why|outdated|pm ls`
+4. **Unknown** — conservative default: `Warning` with `matched_rule =
+   "unknown"`. Phase 2.B treats this as "prompt the user"; Phase 2.C
+   must call out unfamiliar auto-install shapes to the user before
+   running them.
+
+### §16.3 Compound escalation
+
+`contains_compound_construct` detects any of:
+
+- pipes (`|`)
+- logical connectives (`&&`, `||`) — detected via the `&` and `|`
+  byte-level check
+- command separators (`;`)
+- command substitution (`$(…)`, backticks)
+- backgrounding (`&`)
+- file redirects (`<`, `>`)
+
+When a compound construct is present:
+
+- A **Dangerous** match stays Dangerous (already at the top; the
+  `compound` flag is recorded for telemetry).
+- A **Warning** match stays Warning (no double-escalation — the
+  Phase 2.B execution layer already treats Warning as "prompt").
+- A **Safe** match is **escalated to Warning**. The `matched_rule`
+  is preserved so telemetry can still count "safe intent, compound
+  shape" separately from genuinely-unknown commands. The reason
+  string gets a trailing `(escalated: command contains compound
+  shell constructs)` hint for UI display.
+
+This guarantees `npm test && rm -rf /` can never classify as Safe:
+either the `rm -rf /` substring fires `dangerous.rm_rf_root`
+directly (which is the case), or — for less-obvious tails — the Safe
+match is lifted to Warning so the UI prompts before executing.
+
+The detector is intentionally naïve (it flags compound constructs
+inside quoted strings too). False positives just mean "escalate one
+tier", which is the safe direction. A Phase 2.B refinement can add
+string-literal awareness if real traffic shows the false-positive
+rate is too high.
+
+### §16.4 Why the `$` anchor was removed from `safe.pkg_builtin`
+
+Earlier drafts anchored `safe.pkg_builtin` with `\s*$`. That broke
+`matched_rule` identification for compound variants: `npm test |
+tee out.log` has a pipe, so the strict anchor never matched, and
+the classifier returned `unknown`. Replacing `\s*$` with `\b` lets
+the base rule match while compound-escalation still bumps the tier
+to Warning. The net result:
+
+| Command                         | `class`   | `matched_rule`      | `compound` |
+| ------------------------------- | --------- | ------------------- | ---------- |
+| `npm test`                      | Safe      | `safe.pkg_builtin`  | false      |
+| `npm test \| tee out.log`       | Warning   | `safe.pkg_builtin`  | true       |
+| `npm test && rm -rf /`          | Dangerous | `dangerous.rm_rf_…` | true       |
+
+### §16.5 `find` special-case
+
+The Rust `regex` crate lacks look-around, so `find … -delete /
+-exec / -execdir / -ok / -okdir` can't be excluded via a negative
+lookahead the way we'd do in PCRE. `match_safe` handles `find`
+explicitly: if the command starts with `find` (or `find ` / `find\t`)
+and contains any of those destructive flags, it falls through to
+`unknown` → Warning. Otherwise it classifies as `safe.find`.
+
+### §16.6 Integration into the codegen envelope lifecycle
+
+`controller::run_codegen_envelope` now reads two additional settings
+(`security_gate_enabled`, `security_gate_warning_mode`) and, after
+`apply_codegen_envelope` succeeds, emits a new `ai:step` event for
+the envelope's `run_cmd` (when present):
+
+```json
+{
+  "role": "security",
+  "label": "security.classified",
+  "status": "done" | "warning" | "failed",
+  "class": "safe" | "warning" | "dangerous",
+  "reason": "<human-readable>",
+  "matched_rule": "<stable id>",
+  "compound": bool,
+  "warning_mode": "prompt" | "allow" | "block",
+  "run_cmd": "<original cmd>"
+}
+```
+
+The event is **informational only** — nothing executes. The UI can
+colour-code (`done` = green, `warning` = amber, `failed` = red) and
+show the rule id for debugging. Phase 2.B will consume the same
+classifier to decide whether to prompt, auto-run, or refuse.
+
+### §16.7 Tauri command: `classify_run_cmd`
+
+A dedicated command lets the UI preview classification for an
+arbitrary string without invoking the full envelope lifecycle:
+
+```rust
+#[tauri::command]
+pub fn classify_run_cmd(cmd: String) -> security_gate::Classification
+```
+
+Registered in `lib.rs` alongside `run_codegen_envelope`. Useful for:
+
+- Settings-dialog preview ("this is what would happen if the model
+  asked you to run `…`").
+- Future Phase 2.B manual override: the user pastes a command, the
+  UI shows class + rule, and the user decides to execute or not.
+
+### §16.8 Settings (two new fields)
+
+- `security_gate_enabled: bool` — default `true`. Off disables both
+  the `ai:step` event emission **and** future Phase 2.B guarding.
+- `security_gate_warning_mode: "prompt" | "allow" | "block"` —
+  default `"prompt"`. Phase 2.A persists this verbatim for the UI
+  to show; Phase 2.B will honour it when deciding how to route a
+  WARNING classification through the confirm modal.
+
+### §16.9 Tests
+
+17 new unit tests in `security_gate::tests`:
+
+- `safe_matrix_passes` — 52 Safe commands.
+- `warning_matrix_prompts` — 40 Warning commands.
+- `dangerous_matrix_blocks` — 31 Dangerous commands.
+- `compound_escalates_safe_to_warning` — pipes, `&&`, `;`,
+  redirects, `$(…)`, backticks each escalate a Safe base.
+- `compound_does_not_downgrade_dangerous` — Dangerous wins even
+  when chained after a Safe command.
+- `compound_preserves_warning_tier` — Warning stays Warning (no
+  double-bump).
+- `unknown_shapes_default_to_warning` — conservative fallback.
+- `empty_command_is_safe_noop` — empty/whitespace-only is Safe.
+- `leading_trailing_whitespace_is_trimmed` — canonicalisation.
+- `case_insensitive_dangerous_matching` — `SUDO`, `Sudo` trigger.
+- `find_with_delete_is_not_safe`, `find_with_exec_is_not_safe` —
+  special-case fall-through.
+- `unknown_script_name_does_not_match_safe_run` — `npm run deploy`
+  is *not* Safe.
+- `security_class_ordering_holds`, `event_status_mapping`,
+  `classification_is_json_serializable`,
+  `classifier_is_deterministic`.
+
+Full suite: **121/121** passing (104 pre-existing + 17 new).
+`cargo check` clean.
+
+### §16.10 Out of scope (intentionally deferred)
+
+- **Execution of `run_cmd`.** Phase 2.B. The classifier is the
+  deciding layer but the executor must add stream capture, timeout,
+  sandbox check, and streaming-to-terminal integration.
+- **Rewiring `tools::should_prompt_run_cmd` onto the classifier.**
+  Phase 2.B. Doing it now would change a well-tested production
+  path inside a classifier-introduction PR.
+- **Auto-install flow.** Phase 2.C. Must use `classify()` to vet
+  the `bun add / npm install <missing>` commands it synthesises
+  from `dependency_guard`'s miss list (§15).
+- **String-literal-aware compound detector.** Out-of-scope refinement
+  if false-positive rate on compound escalation turns out to matter
+  in real traffic.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*

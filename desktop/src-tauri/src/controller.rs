@@ -27,6 +27,7 @@ use crate::compiler_gate::{self, CompileOutcome};
 use crate::dependency_guard::{self, GuardOutcome};
 use crate::fs_ops;
 use crate::project_scan;
+use crate::security_gate;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
 use crate::AppState;
 
@@ -1287,7 +1288,15 @@ pub async fn run_codegen_envelope(
     history: Vec<UiMessage>,
     autonomous_confirm: bool,
 ) -> Result<AppliedEnvelope, String> {
-    let (gate_enabled, max_compile_retries, tsc_timeout_secs, dep_guard_enabled, dep_guard_mode) = {
+    let (
+        gate_enabled,
+        max_compile_retries,
+        tsc_timeout_secs,
+        dep_guard_enabled,
+        dep_guard_mode,
+        security_gate_enabled,
+        security_gate_warning_mode,
+    ) = {
         let s = state.read_settings();
         (
             s.compiler_gate_enabled,
@@ -1295,6 +1304,8 @@ pub async fn run_codegen_envelope(
             s.tsc_timeout_secs,
             s.dependency_guard_enabled,
             s.dependency_guard_mode.clone(),
+            s.security_gate_enabled,
+            s.security_gate_warning_mode.clone(),
         )
     };
 
@@ -1611,11 +1622,53 @@ pub async fn run_codegen_envelope(
             "run_cmd": result.run_cmd,
         }),
     );
+
+    // Phase 2.A (V6 §VII.2) — classify any surfaced `run_cmd` and
+    // emit a `security.classified` event so the UI can render risk
+    // before Phase 2.B wires up actual execution. We do NOT execute
+    // the command here; the event is informational only. The
+    // classifier is deterministic (same input → same output) and has
+    // no side effects, so it's safe to run unconditionally when
+    // `run_cmd` is present.
+    if security_gate_enabled {
+        if let Some(cmd) = result.run_cmd.as_deref() {
+            let classification = security_gate::classify(cmd);
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "security",
+                    "label": "security.classified",
+                    "status": classification.class.as_event_status(),
+                    "class": classification.class,
+                    "reason": classification.reason,
+                    "matched_rule": classification.matched_rule,
+                    "compound": classification.compound,
+                    "warning_mode": security_gate_warning_mode,
+                    "run_cmd": cmd,
+                }),
+            );
+        }
+    }
+
     // `last_diagnostics` is retained for future telemetry sinks — it
     // contains the most recent successful-repair feedback, which is
     // useful for post-mortem / failure-memory aggregation (V6 §III.1).
     let _ = last_diagnostics;
     Ok(result)
+}
+
+/// Phase 2.A (V6 §VII.2) — Tauri command that classifies a single
+/// `run_cmd` string and returns the full [`security_gate::Classification`].
+///
+/// Exposed so the UI can preview the risk of a command before it is
+/// ever executed. Pure function wrapper: no filesystem access, no
+/// network, no LLM — the same input always returns the same output.
+/// Phase 2.B will consume the same classifier inside the execution
+/// layer; keeping this command additive lets the UI surface
+/// classification today without depending on execution wiring.
+#[tauri::command]
+pub fn classify_run_cmd(cmd: String) -> security_gate::Classification {
+    security_gate::classify(&cmd)
 }
 
 /// Truncate a long tsc output for log lines so a catastrophic compile
