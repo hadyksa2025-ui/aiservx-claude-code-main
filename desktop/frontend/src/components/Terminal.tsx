@@ -4,6 +4,13 @@ import { api, onEvent } from "../api";
 interface TerminalProps {
   projectDir: string | null;
   terminalId: string;
+  /**
+   * When true, this terminal renders the AI agent's tool stream. The
+   * input box is hidden (the user doesn't drive this tab) and Ctrl+C
+   * is ignored — agent cancellation goes through the goal cancel flow,
+   * not through `terminalKill`.
+   */
+  agentMode?: boolean;
   onRunningChange?: (running: boolean) => void;
 }
 
@@ -13,7 +20,7 @@ interface OutputLine {
   stream: "stdout" | "stderr";
 }
 
-export function Terminal({ projectDir, terminalId, onRunningChange }: TerminalProps) {
+export function Terminal({ projectDir, terminalId, agentMode = false, onRunningChange }: TerminalProps) {
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
@@ -123,8 +130,13 @@ export function Terminal({ projectDir, terminalId, onRunningChange }: TerminalPr
   };
 
   return (
-    <div className="terminal">
+    <div className={`terminal${agentMode ? " terminal-agent" : ""}`}>
       <div className="terminal-output" ref={outputRef}>
+        {agentMode && lines.length === 0 && (
+          <div className="terminal-line terminal-agent-hint">
+            Agent is idle. AI tool output (read_file, write_file, run_cmd, …) will stream here live.
+          </div>
+        )}
         {lines.map((line) => (
           <div
             key={line.id}
@@ -134,27 +146,29 @@ export function Terminal({ projectDir, terminalId, onRunningChange }: TerminalPr
             {line.text}
           </div>
         ))}
-        {running && (
+        {running && !agentMode && (
           <div className="terminal-line terminal-running">
             <span className="terminal-cursor">$ </span>
             <span className="terminal-spinner">...</span>
           </div>
         )}
       </div>
-      <div className="terminal-input-line">
-        <span className="terminal-prompt">$</span>
-        <input
-          ref={inputRef}
-          type="text"
-          className="terminal-input"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={!projectDir || running}
-          placeholder={projectDir ? "Type command..." : "Open a project first"}
-          autoFocus
-        />
-      </div>
+      {!agentMode && (
+        <div className="terminal-input-line">
+          <span className="terminal-prompt">$</span>
+          <input
+            ref={inputRef}
+            type="text"
+            className="terminal-input"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={!projectDir || running}
+            placeholder={projectDir ? "Type command..." : "Open a project first"}
+            autoFocus
+          />
+        </div>
+      )}
     </div>
   );
 }

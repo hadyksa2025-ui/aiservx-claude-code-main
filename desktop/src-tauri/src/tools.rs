@@ -12,6 +12,15 @@
 //! (`tools::execute_run_cmd_gated`). The direct `run_cmd` Tauri command
 //! remains unrestricted so the UI's own Terminal/Explorer surfaces can run
 //! arbitrary commands with user intent.
+//!
+//! **Terminal Authority (PROJECT_MEMORY.md §12).** Every side-effecting
+//! AI tool call must be visible in the Agent terminal tab
+//! (`terminal_id = "agent-main"`). `execute_run_cmd_gated`,
+//! `execute_write_file_gated`, and the read-only surfaces in
+//! `execute_safe` all emit `terminal:output` events keyed to
+//! [`AGENT_TERMINAL_ID`] so the user sees exactly what the agent is
+//! doing, matching Devin / Windsurf visible-execution behavior. Direct
+//! user-driven terminals still use their own per-tab ids.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -25,6 +34,26 @@ use tokio::sync::oneshot;
 
 use crate::cancel::CancelToken;
 use crate::{fs_ops, AppState};
+
+/// Stable terminal id used for every side-effecting AI tool invocation.
+/// The frontend pins a tab with this id so the agent stream is always
+/// visible regardless of how many user-driven terminals exist.
+pub const AGENT_TERMINAL_ID: &str = "agent-main";
+
+/// Emit a single line of agent output to the pinned Agent terminal tab.
+/// `stream` is `"stdout"` (default content) or `"stderr"` (errors /
+/// refusals). The caller is responsible for adding a trailing newline
+/// when the line should end; raw streamed bytes pass through verbatim.
+pub(crate) fn emit_agent_line(app: &AppHandle, stream: &str, data: impl Into<String>) {
+    let _ = app.emit(
+        "terminal:output",
+        json!({
+            "terminal_id": AGENT_TERMINAL_ID,
+            "stream": stream,
+            "data": data.into(),
+        }),
+    );
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunCmdResult {
@@ -124,6 +153,7 @@ pub async fn execute_safe(
     match name {
         "read_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            emit_agent_line(app, "stdout", format!("$ read_file {path}\n"));
             let content = fs_ops::read_file(project_dir.to_string(), path.to_string())?;
             let truncated = if content.len() > 100_000 {
                 format!(
@@ -134,6 +164,11 @@ pub async fn execute_safe(
             } else {
                 content
             };
+            emit_agent_line(
+                app,
+                "stdout",
+                format!("  → {} bytes\n", truncated.len()),
+            );
             Ok((
                 truncated,
                 None,
@@ -148,12 +183,18 @@ pub async fn execute_safe(
         }
         "list_dir" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            emit_agent_line(app, "stdout", format!("$ list_dir {path}\n"));
             let entries = fs_ops::list_dir(project_dir.to_string(), path.to_string())?;
             let summary = entries
                 .iter()
                 .map(|e| format!("{}{}", if e.is_dir { "📁 " } else { "📄 " }, e.name))
                 .collect::<Vec<_>>()
                 .join("\n");
+            emit_agent_line(
+                app,
+                "stdout",
+                format!("  → {} entries\n", entries.len()),
+            );
             Ok((summary, None, ToolEffect::default()))
         }
         other => Err(format!("unknown safe tool: {other}")),
@@ -273,11 +314,17 @@ pub(crate) async fn execute_write_file_gated(
         }
     }
 
+    emit_agent_line(
+        app,
+        "stdout",
+        format!("$ write_file {path} ({} bytes)\n", content.len()),
+    );
     let diff = fs_ops::write_file(
         project_dir.to_string(),
         path.to_string(),
         content.to_string(),
     )?;
+    emit_agent_line(app, "stdout", format!("  ✓ wrote {path}\n"));
     Ok((
         format!("wrote {}", path),
         Some(diff),
@@ -409,7 +456,13 @@ pub async fn execute_run_cmd_gated(
         }
     }
 
-    let result = run_cmd_impl(project_dir, cmd, timeout_ms, Some(cancel)).await?;
+    emit_agent_line(app, "stdout", format!("$ {cmd}\n"));
+    let result = run_cmd_impl(project_dir, cmd, timeout_ms, Some(cancel), Some(app)).await;
+    match &result {
+        Ok(r) => emit_agent_line(app, "stdout", format!("[exit {}]\n", r.exit_code)),
+        Err(e) => emit_agent_line(app, "stderr", format!("[error: {e}]\n")),
+    }
+    let result = result?;
     let mut out = String::new();
     out.push_str(&format!("exit {}\n", result.exit_code));
     if !result.stdout.is_empty() {
@@ -507,7 +560,7 @@ pub async fn run_cmd(
 ) -> Result<RunCmdResult, String> {
     // Direct user-initiated invocation: no cooperative cancel is wired
     // here, only the timeout.
-    run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000), None).await
+    run_cmd_impl(&project_dir, &cmd, timeout_ms.unwrap_or(30_000), None, None).await
 }
 
 /// Streaming shell runner. Emits `terminal:output` events with stdout/stderr
@@ -731,6 +784,7 @@ async fn run_cmd_impl(
     cmd: &str,
     timeout_ms: u64,
     cancel: Option<&CancelToken>,
+    app: Option<&AppHandle>,
 ) -> Result<RunCmdResult, String> {
     let root = std::path::Path::new(project_dir)
         .canonicalize()
@@ -788,74 +842,117 @@ async fn run_cmd_impl(
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
-    // Drive the child through its cancel/timeout gauntlet. On cancel we
-    // kill the entire process *tree* (see `kill_tree`) so we don't leak
-    // runaway grandchildren; the reaped status is discarded.
-    let cancel_fut = async {
-        match cancel {
-            Some(c) => c.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
-
+    // Drive the child through its cancel/timeout gauntlet while tee-ing
+    // any piped output to the Agent terminal tab in real time. On cancel
+    // we kill the entire process *tree* (see `kill_tree`) so we don't
+    // leak runaway grandchildren; the reaped status is discarded.
     let timeout_dur = Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout_dur;
 
-    let status = tokio::select! {
-        biased;
-        _ = cancel_fut => {
-            kill_tree(&mut child, child_pid).await;
-            // Compute the error string *after* the token has fired so we
-            // capture the actual CancelReason (User / Goal / Timeout / ...)
-            // instead of the bare "cancelled" the token carried before it
-            // was tripped.
-            return Err(cancel.map(|c| c.err_string()).unwrap_or_else(|| "cancelled".into()));
-        }
-        r = tokio::time::timeout(timeout_dur, child.wait()) => match r {
-            Ok(s) => s.map_err(|e| e.to_string())?,
-            Err(_) => {
+    let mut out_str = String::new();
+    let mut err_str = String::new();
+    let mut out_buf = [0u8; 512];
+    let mut err_buf = [0u8; 512];
+
+    // Read pipes incrementally alongside `child.wait()` so every chunk
+    // can be forwarded to `app` (when present) before the process ends.
+    // Each iteration races: cancel, timeout deadline, stdout ready,
+    // stderr ready, and child-exit. The loop terminates when the child
+    // exits *or* is torn down by cancel/timeout.
+    let exit_code: i32 = loop {
+        tokio::select! {
+            biased;
+            _ = async {
+                match cancel {
+                    Some(c) => c.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                kill_tree(&mut child, child_pid).await;
+                return Err(cancel.map(|c| c.err_string()).unwrap_or_else(|| "cancelled".into()));
+            }
+            _ = tokio::time::sleep_until(deadline) => {
                 kill_tree(&mut child, child_pid).await;
                 return Err(format!("run_cmd timed out after {timeout_ms}ms"));
             }
+            r = async {
+                match stdout_pipe.as_mut() {
+                    Some(p) => p.read(&mut out_buf).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match r {
+                    Ok(0) => { stdout_pipe = None; }
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&out_buf[..n]).to_string();
+                        out_str.push_str(&text);
+                        if let Some(app) = app {
+                            emit_agent_line(app, "stdout", text);
+                        }
+                    }
+                    Err(_) => { stdout_pipe = None; }
+                }
+            }
+            r = async {
+                match stderr_pipe.as_mut() {
+                    Some(p) => p.read(&mut err_buf).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match r {
+                    Ok(0) => { stderr_pipe = None; }
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&err_buf[..n]).to_string();
+                        err_str.push_str(&text);
+                        if let Some(app) = app {
+                            emit_agent_line(app, "stderr", text);
+                        }
+                    }
+                    Err(_) => { stderr_pipe = None; }
+                }
+            }
+            r = child.wait() => {
+                let wait_status = r.map_err(|e| e.to_string())?;
+                // Drain whatever is still buffered in the pipes so the
+                // returned strings are complete (matches pre-refactor
+                // semantics for callers that consume `stdout`/`stderr`).
+                if let Some(ref mut so) = stdout_pipe {
+                    loop {
+                        match so.read(&mut out_buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&out_buf[..n]).to_string();
+                                out_str.push_str(&text);
+                                if let Some(app) = app {
+                                    emit_agent_line(app, "stdout", text);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref mut se) = stderr_pipe {
+                    loop {
+                        match se.read(&mut err_buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&err_buf[..n]).to_string();
+                                err_str.push_str(&text);
+                                if let Some(app) = app {
+                                    emit_agent_line(app, "stderr", text);
+                                }
+                            }
+                        }
+                    }
+                }
+                break wait_status.code().unwrap_or(-1);
+            }
         }
     };
-
-    // Drain pipes after the child has exited (or been killed). The drain
-    // itself is also cancel-aware so a late cancel doesn't hang here.
-    let mut out_str = String::new();
-    if let Some(ref mut so) = stdout_pipe {
-        let drain = so.read_to_string(&mut out_str);
-        let cancel_fut = async {
-            match cancel {
-                Some(c) => c.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancel_fut => return Err(cancel.map(|c| c.err_string()).unwrap_or_else(|| "cancelled".into())),
-            _ = drain => {}
-        }
-    }
-    let mut err_str = String::new();
-    if let Some(ref mut se) = stderr_pipe {
-        let drain = se.read_to_string(&mut err_str);
-        let cancel_fut = async {
-            match cancel {
-                Some(c) => c.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancel_fut => return Err(cancel.map(|c| c.err_string()).unwrap_or_else(|| "cancelled".into())),
-            _ = drain => {}
-        }
-    }
 
     Ok(RunCmdResult {
         stdout: out_str,
         stderr: err_str,
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
     })
 }
 
@@ -977,6 +1074,7 @@ mod cancel_tests {
             if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
             30_000,
             Some(&token),
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1013,6 +1111,7 @@ mod cancel_tests {
             if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
             30_000,
             Some(&token),
+            None,
         )
         .await;
         match &res {
@@ -1034,6 +1133,7 @@ mod cancel_tests {
             if cfg!(windows) { "timeout /T 30" } else { "sleep 30" },
             30_000,
             Some(&token),
+            None,
         )
         .await;
         // Reason is propagated through to the error string.
@@ -1052,6 +1152,7 @@ mod cancel_tests {
             dir.to_str().unwrap(),
             if cfg!(windows) { "echo hi" } else { "echo hi" },
             10_000,
+            None,
             None,
         )
         .await
@@ -1106,6 +1207,7 @@ mod cancel_tests {
             &script,
             60_000,
             Some(&token),
+            None,
         )
         .await;
         assert!(

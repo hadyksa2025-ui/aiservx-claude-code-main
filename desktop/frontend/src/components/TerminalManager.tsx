@@ -5,7 +5,17 @@ import { api } from "../api";
 type TerminalTab = {
   id: string;
   title: string;
+  /**
+   * Pinned tabs are created by the app itself (currently: the "Agent"
+   * tab that mirrors every AI tool call). They cannot be closed and
+   * are not recycled on project change. See PROJECT_MEMORY.md §12
+   * Terminal Authority.
+   */
+  pinned?: "agent";
 };
+
+/** Stable id the backend uses for every AI-tool `terminal:output` event. */
+const AGENT_TERMINAL_ID = "agent-main";
 
 function newTerminalId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -30,6 +40,7 @@ function newTerminalId(): string {
  */
 export function TerminalManager({ projectDir }: { projectDir: string | null }) {
   const [tabs, setTabs] = useState<TerminalTab[]>(() => [
+    { id: AGENT_TERMINAL_ID, title: "Agent", pinned: "agent" },
     { id: newTerminalId(), title: "Terminal 1" },
   ]);
   const [activeId, setActiveId] = useState(() => tabs[0]!.id);
@@ -37,7 +48,9 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
 
   useEffect(() => {
     // Snapshot so we don't race with handleRunningChange mutations while
-    // the kill RPCs are still in flight.
+    // the kill RPCs are still in flight. Pinned tabs (Agent) are driven
+    // by the AI tool loop, not by a direct spawn this component owns, so
+    // they aren't in `runningRef` and aren't killed here.
     const toKill = Array.from(runningRef.current);
     runningRef.current.clear();
 
@@ -52,9 +65,15 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
     })();
 
     // New project == new terminal sessions (avoid cross-project mixing).
-    const id = newTerminalId();
-    setTabs([{ id, title: "Terminal 1" }]);
-    setActiveId(id);
+    // Keep the pinned Agent tab — it represents the AI execution surface,
+    // not a user session, and is always-on. Only user-driven tabs are
+    // recycled here.
+    const userTabId = newTerminalId();
+    setTabs([
+      { id: AGENT_TERMINAL_ID, title: "Agent", pinned: "agent" },
+      { id: userTabId, title: "Terminal 1" },
+    ]);
+    setActiveId(userTabId);
   }, [projectDir]);
 
   useEffect(() => {
@@ -89,6 +108,10 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
   );
 
   const closeTab = useCallback(async (id: string) => {
+    // Pinned tabs (Agent) are lifecycle-owned by the app, not the user,
+    // so the close button is hidden for them — but guard here too so
+    // that a programmatic call can't accidentally drop the Agent tab.
+    if (id === AGENT_TERMINAL_ID) return;
     if (runningRef.current.has(id)) {
       runningRef.current.delete(id);
       try {
@@ -98,7 +121,10 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
       }
     }
     setTabs((prev) => {
-      if (prev.length <= 1) return prev;
+      // Always keep at least one user-driven tab in addition to the
+      // pinned Agent tab, so the user has somewhere to type.
+      const userTabs = prev.filter((t) => !t.pinned);
+      if (userTabs.length <= 1) return prev;
       return prev.filter((t) => t.id !== id);
     });
   }, []);
@@ -111,7 +137,8 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
             key={t.id}
             className={
               "terminal-manager-tab" +
-              (t.id === activeId ? " terminal-manager-tab-active" : "")
+              (t.id === activeId ? " terminal-manager-tab-active" : "") +
+              (t.pinned === "agent" ? " terminal-manager-tab-agent" : "")
             }
             role="tab"
             aria-selected={t.id === activeId}
@@ -120,11 +147,18 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
               type="button"
               className="terminal-manager-tab-btn"
               onClick={() => setActiveId(t.id)}
-              title={t.title}
+              title={t.pinned === "agent" ? "Live AI tool execution" : t.title}
             >
-              {t.title}
+              {t.pinned === "agent" ? (
+                <>
+                  <span className="terminal-manager-tab-agent-dot" aria-hidden="true">●</span>
+                  {t.title}
+                </>
+              ) : (
+                t.title
+              )}
             </button>
-            {tabs.length > 1 && (
+            {!t.pinned && tabs.filter((x) => !x.pinned).length > 1 && (
               <button
                 type="button"
                 className="terminal-manager-tab-close"
@@ -152,6 +186,7 @@ export function TerminalManager({ projectDir }: { projectDir: string | null }) {
         <Terminal
           projectDir={projectDir}
           terminalId={active.id}
+          agentMode={active.pinned === "agent"}
           onRunningChange={(running) => handleRunningChange(active.id, running)}
         />
       </div>

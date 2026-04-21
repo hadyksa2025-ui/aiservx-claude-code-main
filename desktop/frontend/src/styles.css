@@ -2022,3 +2022,30 @@ button.system-action:hover {
   flex: 1;
   min-height: 0;
 }
+
+/* Agent tab: always-on, pinned left. Subtle accent so it reads as a
+   system surface (not a user shell). See PROJECT_MEMORY.md §12. */
+.terminal-manager-tab-agent {
+  border-color: rgba(138, 180, 255, 0.35);
+  background: rgba(91, 140, 255, 0.04);
+}
+.terminal-manager-tab-agent.terminal-manager-tab-active {
+  border-color: var(--accent);
+  background: rgba(91, 140, 255, 0.12);
+}
+.terminal-manager-tab-agent-dot {
+  color: #4ade80;
+  font-size: 8px;
+  line-height: 1;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.terminal-agent .terminal-output {
+  background: rgba(91, 140, 255, 0.02);
+}
+.terminal-agent-hint {
+  color: var(--fg-dim);
+  font-style: italic;
+  padding: 4px 0;
+}

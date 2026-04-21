@@ -1216,5 +1216,99 @@ retry itself surfaces which of them actually matter in practice.
 
 ---
 
+## 12. Terminal Authority Invariant (Phase 0)
+
+### Why it exists
+
+The STRICT REFOCUS MODE directive mandates that **every side-effecting
+AI operation go through the internal terminal** — the same surface the
+user types into — so execution is visible and traceable (Devin /
+Windsurf behaviour). Before Phase 0 the AI path was split in two:
+
+* `run_cmd_stream` (Tauri command invoked from `Terminal.tsx`) emitted
+  `terminal:output` events and showed up live in the Terminal pane.
+* `execute_run_cmd_gated` / `execute_write_file_gated` (invoked by the
+  Executor during `run_chat_turn` / `execute_task_with_retries`) ran
+  through `run_cmd_impl` and `fs_ops::write_file` **silently** — their
+  output was captured as a string, returned as a `tool_result`, and
+  only ever reached the UI via the Debug pane. From the user's point
+  of view the agent was operating in a dark room.
+
+Phase 0 closes that gap.
+
+### Invariant
+
+> **Every AI tool invocation that has a side-effect emits
+> `terminal:output` events to a single pinned terminal tab
+> (`terminal_id = "agent-main"`).**
+
+Tools in scope:
+
+| tool         | emitted on | emitted to          |
+|--------------|-----------|---------------------|
+| `read_file`  | entry + `→ N bytes` summary | stdout |
+| `list_dir`   | entry + `→ N entries` summary | stdout |
+| `write_file` | `$ write_file <path> (N bytes)` / `✓ wrote <path>` | stdout |
+| `run_cmd`    | full command banner + every stdout/stderr chunk streamed live + `[exit <code>]` | stdout/stderr |
+
+The `tool_result` payload returned to the LLM is unchanged — the Agent
+tab is a *tee*, not a replacement, so model reasoning is identical
+before and after.
+
+### Implementation (stable IDs, one helper)
+
+Backend (`desktop/src-tauri/src/tools.rs`):
+
+* `pub const AGENT_TERMINAL_ID: &str = "agent-main"` — single source of
+  truth for the stream id.
+* `pub(crate) fn emit_agent_line(app: &AppHandle, stream: &str, data: impl Into<String>)`
+  — fires a `terminal:output { terminal_id, stream, data }` event. Every
+  gated tool path funnels through this helper.
+* `run_cmd_impl` now takes `app: Option<&AppHandle>`. When supplied it
+  tees every 512-byte pipe chunk to `emit_agent_line` alongside the
+  existing cancel/timeout plumbing — the returned `RunCmdResult` still
+  carries the full `stdout`/`stderr` strings so callers that consume
+  them (and the unit tests) are unaffected. The direct `run_cmd` Tauri
+  command still passes `None` because the user-facing Terminal pane
+  already streams via `run_cmd_stream`.
+
+Frontend:
+
+* `TerminalManager.tsx` seeds the tabs array with a pinned tab
+  `{ id: "agent-main", title: "Agent", pinned: "agent" }` and preserves
+  it across project switches (only user-driven tabs are recycled). The
+  close button is suppressed for pinned tabs and `closeTab` short-circuits
+  on `AGENT_TERMINAL_ID` as a defensive second gate.
+* `Terminal.tsx` gained an `agentMode` prop. In agent mode the input
+  row is not rendered (the tab is observer-only — goal cancel goes
+  through the existing Cancel button, not `terminalKill`), and an
+  idle-state hint renders before the first chunk arrives.
+* `styles.css` adds the pinned-tab accent + live-dot styling under
+  `.terminal-manager-tab-agent` / `.terminal-agent`.
+
+### How it's verified
+
+Phase 0 is intentionally **compile-only** — no UI testing is done on
+this PR. The real evidence comes from Phases 1-6 (OpenRouter
+validation) which will exercise the invariant live.
+
+What ships with this PR:
+
+* `cargo check` + `cargo test --lib tools::` (15/15 pass, including the
+  cancel / tree-kill regression suite rewired through the new 5-arg
+  signature).
+* `bunx tsc --noEmit` clean.
+* `bunx vite build` clean.
+
+### User-facing guarantee
+
+After Phase 0, starting a goal auto-focuses (if not already active)
+the pinned **Agent** tab, and every tool invocation appears there in
+order, with stdout/stderr distinguished, and an `[exit N]` line that
+closes each `run_cmd`. There is no code path in the Executor that can
+touch disk or spawn a process without the Agent tab seeing it.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
