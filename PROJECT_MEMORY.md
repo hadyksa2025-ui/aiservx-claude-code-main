@@ -1668,5 +1668,206 @@ fixes tighten the existing lifecycle without altering the
 
 ---
 
+## 15. OC-Titan Phase 1.C — Dependency guard
+
+Phase 1.C is V6 §I.6 — "Validate imports vs `package.json` BEFORE
+writing. Fail loudly if unresolved." It closes the phantom-import
+failure mode documented by `OPENROUTER_VALIDATION_REPORT` §3 L2/L3
+(model hallucinates an import for a package that was never installed,
+then the compiler gate burns retry slots rediscovering the same
+mistake). The guard runs **after** the JSON envelope is validated
+(Phase 1.A) and **before** the compiler gate (Phase 1.B), so
+envelopes that can't possibly compile are bounced without spending a
+`tsc --noEmit` budget on them.
+
+### Module map
+
+- `dependency_guard.rs` — new module. ~600 LoC + 21 unit tests.
+  Regex-based import extractor (no tree-sitter / swc — keeps the
+  Tauri bundle small). Public surface:
+  - `GuardOutcome` — `Ok { resolved }` / `Skipped { reason }` /
+    `Missing { missing, per_file }` / `Warned { missing, per_file }`.
+    Re-exported through `use crate::dependency_guard::{self,
+    GuardOutcome};` in `controller.rs`.
+  - `check_envelope(project_dir, envelope, enabled, mode)` — the
+    single call site from the controller. Returns `Result<GuardOutcome,
+    String>`.
+  - `missing_to_feedback(outcome)` — renders the re-prompt payload
+    consumed by `build_dependency_feedback_prompt`.
+- `settings.rs` — two new fields, backward-compatible via
+  `#[serde(default = …)]`:
+  - `dependency_guard_enabled: bool` (default `true`).
+  - `dependency_guard_mode: String` (default `"fail"`; other
+    accepted value is `"warn"`).
+- `controller.rs` — new reprompt builder
+  `build_dependency_feedback_prompt` and new guard step inside the
+  `run_codegen_envelope` retry loop (§4.4 below).
+
+### Specifier extraction
+
+Four import shapes are recognised in `.ts` / `.tsx` / `.js` /
+`.jsx` / `.mts` / `.cts` envelope files (all other files are
+ignored — JSON, CSS, MD, etc. never import packages):
+
+1. Static `import ... from 'pkg'` / `import 'pkg'` / `export ...
+   from 'pkg'`.
+2. `require('pkg')` (CommonJS).
+3. Dynamic `import('pkg')` (ESM lazy import).
+4. Bare side-effect imports (`import 'pkg/register'`).
+
+Comments are stripped first (line `//` and block `/* */`) so the
+guard does not flag imports that are deliberately commented out.
+String literals use single, double, or backtick quotes — the regex
+set covers all three.
+
+### Specifier classification
+
+Each extracted specifier is run through `classify_specifier`, which
+returns `Some(package_root)` or `None`:
+
+- **None** (skip): relative (`./`, `../`), absolute (`/`), Node
+  builtins (`fs`, `path`, `crypto`, …), namespaced schemes
+  (`node:fs`, `bun:test`, `deno:net`, `file:…`), empty specifiers.
+- **Some**: every other specifier, normalised to its package root:
+  - `lodash/debounce` → `lodash`.
+  - `@tanstack/react-query/devtools` → `@tanstack/react-query` (for
+    scoped packages the first *two* segments are kept).
+
+The Node builtin list has 41 entries (`assert`, `buffer`,
+`child_process`, `crypto`, `fs`, `http`, `https`, `net`, `os`,
+`path`, `process`, `stream`, `tls`, `url`, `util`, `zlib`, …) and
+is defined as a static `HashSet` so lookups are O(1).
+
+### `package.json` declared-deps set
+
+`load_declared_deps(project_dir)` reads `<project>/package.json` and
+returns a `BTreeSet<String>` that is the **union** of all four
+dependency sections:
+
+1. `dependencies`
+2. `devDependencies`
+3. `peerDependencies`
+4. `optionalDependencies`
+
+Returns `None` (not an error) when the file is missing or malformed
+— the guard then emits `Skipped { reason: "no_package_json" }` so
+fresh projects without `package.json` don't deadlock codegen.
+
+### Outcome matrix
+
+| Condition | Outcome |
+| --- | --- |
+| `dependency_guard_enabled == false` | `Skipped { reason: "disabled" }` |
+| Envelope has zero `.ts/.tsx/.js/.jsx/.mts/.cts` files | `Skipped { reason: "no_supported_files" }` |
+| No `package.json` in project root | `Skipped { reason: "no_package_json" }` |
+| Every classified specifier resolves | `Ok { resolved: [..] }` |
+| ≥1 specifier doesn't resolve, `mode = "fail"` | `Missing { missing, per_file }` |
+| ≥1 specifier doesn't resolve, `mode = "warn"` | `Warned { missing, per_file }` |
+
+`apply_mode` is the single downgrade point: `Missing` + `mode =
+"warn"` → `Warned`. Every other outcome passes through unchanged.
+
+### Guard integration into `run_codegen_envelope`
+
+Inserted between `run_codegen_envelope_turn` and the compiler-gate
+`skip_policy` check. The guard **shares** `max_compile_retries` with
+the compiler gate — each guard miss consumes one attempt, because
+each miss costs a full model round-trip to fix. Pseudocode:
+
+```
+for attempt in 0..max_attempts {
+    turn = run_codegen_envelope_turn(...)?
+
+    outcome = dependency_guard::check_envelope(
+        project_dir, turn.envelope, dep_enabled, dep_mode,
+    ).await
+
+    match outcome {
+        Ok | Skipped | Warned => emit ai:step, fall through to gate
+        Missing(m) => {
+            emit ai:step "dependency.missing"
+            if attempt+1 >= max_attempts {
+                return Err("dependency guard: … unresolved package(s) …")
+            }
+            current_request = build_dependency_feedback_prompt(...)
+            continue  // skip compiler gate this iteration
+        }
+    }
+
+    // compiler gate (Phase 1.B) runs here
+}
+```
+
+An internal error inside `check_envelope` (e.g. package.json is a
+non-UTF-8 file) is **demoted to `Skipped { reason:
+"internal_error" }`** after emitting an `ai:step` warning — the guard
+must never be the reason a compile refuses to start.
+
+### `ai:step` events (Terminal Authority, V6 §VI.1)
+
+Five new events, all with `role: "guard"`:
+
+- `dependency.ok` — `status: "done"`, carries `resolved_count`.
+- `dependency.skipped` — `status: "done"`, carries `reason`.
+- `dependency.warned` — `status: "warning"`, carries `missing[]`
+  (forwards envelope anyway).
+- `dependency.missing` — `status: "failed"`, carries `missing[]`.
+- `dependency.retry` — `status: "running"`, emitted right before a
+  missing-driven reprompt so the UI can show the retry count.
+- `dependency.error` — `status: "warning"`, only on the demoted
+  internal-error branch.
+
+Reprompts reuse the same frame as `build_compile_feedback_prompt`
+but include the `[dependency guard]` tag so the model can tell the
+two failure modes apart (phantom import vs bad TypeScript).
+
+### Unit tests (21 new, `cargo test --lib dependency_guard`)
+
+- `classify_handles_relative_and_absolute` / `classify_handles_builtins`
+  / `classify_normalises_subpaths_and_scopes` / `classify_empty_is_none`
+- `extract_picks_up_four_shapes` / `extract_ignores_commented_imports`
+- `guard_ok_when_everything_resolves` / `guard_flags_missing_package`
+  / `guard_flags_scoped_package_root_not_subpath`
+  / `guard_skips_non_source_envelopes`
+- `apply_mode_warn_downgrades_missing` /
+  `apply_mode_fail_preserves_missing`
+- `missing_to_feedback_is_stable_and_informative`
+- `load_declared_deps_reads_all_four_sections` /
+  `load_declared_deps_returns_none_when_missing` /
+  `load_declared_deps_returns_none_on_malformed_json`
+- `check_envelope_skips_when_disabled` /
+  `check_envelope_skips_without_package_json` /
+  `check_envelope_detects_missing_end_to_end`
+
+Plus the pair that Devin Review flagged on PR-C
+(`multi_byte_boundary_does_not_panic`,
+`four_byte_emoji_boundary_does_not_panic`) was rewritten to use
+`.repeat(5000)` so they actually enter the truncation branch and
+assert the surviving chars instead of short-circuiting at
+`total_chars <= MAX_CHARS`.
+
+### What is still TODO (intentionally deferred)
+
+- **Auto-fix**: V6 §I.6 mentions "Auto-fix missing dependencies".
+  Phase 1.C is only the **detect + fail loudly** half. Auto-adding
+  packages to `package.json` (and deciding between `dependencies` vs
+  `devDependencies`, picking a version range, running the install)
+  is a separate concern that belongs in Phase 2 alongside `run_cmd`
+  execution — the same security gate needs to guard both.
+- **Workspace resolution**: The guard reads the project root's
+  `package.json`. It does not walk yarn/pnpm/npm workspaces, so an
+  envelope in a subpackage of a monorepo that imports a workspace
+  sibling would currently see a miss. Mitigated today by `mode =
+  "warn"` but worth revisiting when we add monorepo support.
+- **`tsconfig.json` path aliases**: `@/components/Foo` style imports
+  aren't treated as bare packages because they start with `@` — but
+  the current classifier would (correctly) treat them as scoped and
+  look for `@/components`. A future iteration should read
+  `compilerOptions.paths` and exclude matching aliases; for now the
+  guard defaults to `mode = "fail"` but the user can flip to
+  `"warn"` when working in a project that uses aliases heavily.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
