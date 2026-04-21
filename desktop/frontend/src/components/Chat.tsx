@@ -188,8 +188,38 @@ export function Chat({ projectDir, disabled }: Props) {
     unlistens.push(
       onEvent<ExecutorUnparsedEvent>("ai:executor_unparsed", (p) => {
         setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last && last.kind === "warn_action" && last.role === "system") {
+          // Scope the dedup to the *current turn* only. A turn
+          // starts at the last user message and ends at the next
+          // one (see the docstring above `classifyMessages`).
+          //
+          //   * Scanning the whole list is too broad (PR #13 Devin
+          //     Review): once a warn_action lands in turn N, every
+          //     future `ai:executor_unparsed` in turns N+1, N+2, …
+          //     would be silently suppressed, because `messages` is
+          //     only cleared on project switch (App.tsx
+          //     `resetMessages` in `openProject`).
+          //
+          //   * Checking only the last message is too narrow
+          //     (PR #12 Devin Review): the backend can fire this
+          //     event twice inside one turn (executor iteration-0
+          //     empty tool_calls, then reviewer Unknown verdict)
+          //     with a reviewer token bubble streaming between the
+          //     two emissions, so the real warn_action isn't the
+          //     last message any more.
+          //
+          // Scoping to "everything after the last user message"
+          // handles both.
+          let turnStart = 0;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].role === "user") {
+              turnStart = i;
+              break;
+            }
+          }
+          const alreadyWarnedThisTurn = prev
+            .slice(turnStart)
+            .some((m) => m.kind === "warn_action" && m.role === "system");
+          if (alreadyWarnedThisTurn) {
             return prev;
           }
           const modelNote = p.model ? ` (executor: \`${p.model}\`)` : "";

@@ -378,10 +378,19 @@ Executor loop   (call_model(role=Executor), ≤ max_iterations)
   │    └─ stop when model emits final_answer (no tool_call)
   │
   ▼
-Reviewer call   (call_model(role=Reviewer))  — if reviewer_enabled
+Reviewer call   (call_model(role=Reviewer))  — if reviewer_enabled AND NOT json_mode
   │  ├─ sees the executor's tool-call + tool-result transcript
   │  ├─ emits OK: or NEEDS_FIX: <instruction>
   │  └─ NEEDS_FIX feeds back into a retry (up to max_retries_per_task)
+  │
+  │  `json_mode` turns (see §4.2 — used by `plan_goal`) run the
+  │  executor without a tool schema and expect a JSON string back,
+  │  not code changes. Running OK/NEEDS_FIX over pure JSON is
+  │  meaningless and would cause the reviewer to return `Unknown`,
+  │  which in turn fires `ai:executor_unparsed` and renders the
+  │  "try a larger executor model" warning pill for every single
+  │  goal plan. PR #15 therefore skips the reviewer entirely in
+  │  json_mode — see `ai.rs:run_chat_turn` line ~1679.
   │
   ▼
 ChatResponse { final_message, executor_iterations, reviewer_outcome }
