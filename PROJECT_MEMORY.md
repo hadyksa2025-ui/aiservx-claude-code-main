@@ -2444,6 +2444,59 @@ Total lib-test count after PR-H: **148 green** (Phase 1 + 2.A + new).
   `dependency_guard`'s miss list (§15) and route through
   `execute_run_cmd` like any other command.
 
+### §17.10 PR-I hotfixes on PR-H (Devin Review follow-up)
+
+Two real bugs + one design-hole closure surfaced in Devin Review of
+PR-H; fixed together in PR-I.
+
+- **Word-boundary allow-list match** (`run_cmd_gate::allow_list_matches`).
+  Before: `cmd.starts_with(entry)` let `"lsblk"` match the
+  default-allow-list entry `"ls"`, silently downgrading a Warning
+  to AutoRun and bypassing the confirm modal the user opted into.
+  After: match requires `cmd == entry` or `cmd` starts with
+  `entry` **followed by an ASCII space** — restoring parity with
+  the legacy `tools::cmd_matches_prefix`. Empty / whitespace-only
+  entries are ignored so a blank line in `settings.json` can't
+  accidentally allow-list every command. Two regression tests:
+  `allow_list_requires_word_boundary_not_raw_starts_with` (covers
+  `lsblk`, `lsof`, `lsattr`, `catfish`, `findmnt`) and
+  `allow_list_ignores_whitespace_only_entries`.
+
+- **Per-request `autonomous_confirm` override**
+  (`execute_run_cmd(..., autonomous_confirm_override: Option<bool>)`).
+  Before: `execute_run_cmd` read
+  `Settings::autonomous_confirm_irreversible` and ignored the
+  `autonomous_confirm: bool` parameter the UI passes to
+  `run_codegen_envelope`. If the two diverged (mid-flight settings
+  edit, direct API caller), the persisted setting silently won.
+  After: `Some(v)` from the caller wins over the persisted value;
+  `None` keeps the legacy behaviour (standalone
+  `execute_classified_run_cmd` entrypoint). Three regression
+  tests: `execute_autonomous_confirm_override_upgrades_safe_to_prompt`
+  (forces Safe → Prompt), `..._false_lets_safe_autorun` (doesn't
+  block AutoRun on Some(false)), `..._none_falls_back_to_settings`
+  (None → legacy path).
+
+- **Tautological test assertion fixed.** The original
+  `assert!(!allow_list_matches(...) == false || true)` always
+  passed due to `|| true` short-circuit; replaced with a direct
+  negated assert plus broader boundary coverage.
+
+Informational-only review notes (no code change, reply-only):
+
+- Double classification of `run_cmd` in the envelope path (once by
+  `run_codegen_envelope` to emit the `security.classified` event,
+  once inside `execute_run_cmd`). Deterministic + pure, wasted
+  work is microseconds; future refactor could pass the
+  already-computed `Classification` as a parameter.
+- Prompt-arm variable shadowing in `execute_run_cmd` is safe (outer
+  `Option<&AppHandle>` is `Some(...)` by the match arm precondition)
+  but subtle for future maintainers.
+- `tail_for_log` vs `controller::truncate_for_log` — local
+  duplication to avoid cross-module re-export of a private helper;
+  a shared utility with a head/tail mode is a possible future
+  refactor.
+
 ---
 
 *If something here is wrong or incomplete, fix it in-place rather than

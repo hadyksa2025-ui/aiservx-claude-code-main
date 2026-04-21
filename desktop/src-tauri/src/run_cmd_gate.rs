@@ -236,14 +236,33 @@ pub fn decide(inputs: &PolicyInputs<'_>) -> Decision {
     }
 }
 
-/// Whether `cmd` is prefix-matched by any entry in `allow_list`.
-/// Extracted so tests can exercise the match logic directly and so
-/// the migration shim over `execute_run_cmd_gated` can reuse it.
+/// Whether `cmd` is matched by any entry in `allow_list`.
+///
+/// A match requires either an exact-string equality or that the entry
+/// is a **word-boundary prefix** of `cmd` — i.e. `cmd` begins with
+/// the entry followed by an ASCII space. A raw `starts_with` would
+/// silently promote `"lsblk"` to AutoRun just because `"ls"` is on
+/// the allow-list, which is a security regression vs the legacy
+/// `tools::cmd_matches_prefix` behaviour (PR-I fix for PR-H).
+///
+/// Empty / whitespace-only entries in the allow-list are ignored so
+/// a blank line in settings.json can't silently allow-list every
+/// command.
 pub fn allow_list_matches(cmd: &str, allow_list: &[String]) -> bool {
     let cmd = cmd.trim();
-    allow_list
-        .iter()
-        .any(|p| !p.is_empty() && cmd.starts_with(p.as_str()))
+    allow_list.iter().any(|entry| {
+        let p = entry.trim();
+        if p.is_empty() {
+            return false;
+        }
+        if cmd == p {
+            return true;
+        }
+        match cmd.strip_prefix(p) {
+            Some(rest) => rest.starts_with(' '),
+            None => false,
+        }
+    })
 }
 
 /// UTF-8 char-bounded tail; identical invariants to
@@ -315,12 +334,21 @@ fn emit_step(app: Option<&AppHandle>, event: &str, status: &str, payload: serde_
 /// `cancel` is threaded into `run_cmd_impl` and
 /// `await_user_confirmation` so a goal-level cancel aborts the gate
 /// no matter where it is parked.
+///
+/// `autonomous_confirm_override`: when `Some(v)`, `v` wins over the
+/// persisted `Settings::autonomous_confirm_irreversible`. This lets
+/// the envelope entrypoint thread the per-request `autonomous_confirm`
+/// flag (which the UI may set for a single run, distinct from the
+/// global preference) without racing on a mid-flight settings edit.
+/// When `None`, the persisted setting is consulted (legacy /
+/// standalone Tauri entrypoint behaviour).
 pub async fn execute_run_cmd(
     app: Option<&AppHandle>,
     state: Option<&AppState>,
     project_dir: &str,
     cmd: &str,
     cancel: Option<&CancelToken>,
+    autonomous_confirm_override: Option<bool>,
 ) -> Result<ExecutionResult, String> {
     let cmd_trimmed = cmd.trim();
     if cmd_trimmed.is_empty() {
@@ -331,7 +359,7 @@ pub async fn execute_run_cmd(
     // warning_mode / timeout. This path is unused in production
     // (controller always passes a state) but makes unit testing the
     // happy path possible without building a full Tauri harness.
-    let (warning_mode, dangerous_policy, autonomous_confirm, allow_list, timeout_ms) =
+    let (warning_mode, dangerous_policy, autonomous_confirm_settings, allow_list, timeout_ms) =
         match state {
             Some(s) => snapshot_settings(s),
             None => (
@@ -342,6 +370,9 @@ pub async fn execute_run_cmd(
                 120_000u64,
             ),
         };
+    // Per-request override wins over the persisted setting; this is
+    // the fix for Devin Review PR-H comment #3120677225.
+    let autonomous_confirm = autonomous_confirm_override.unwrap_or(autonomous_confirm_settings);
 
     let classification = security_gate::classify(cmd_trimmed);
     let allow_list_match = allow_list_matches(cmd_trimmed, &allow_list);
@@ -580,12 +611,15 @@ pub async fn execute_classified_run_cmd(
 ) -> Result<ExecutionResult, String> {
     let state = app.state::<AppState>();
     let cancel = state.cancelled.clone();
+    // Standalone entrypoint: no per-request override, so fall back
+    // to the persisted `autonomous_confirm_irreversible` setting.
     execute_run_cmd(
         Some(&app),
         Some(state.inner()),
         &project_dir,
         &cmd,
         Some(&cancel),
+        None,
     )
     .await
 }
@@ -797,8 +831,35 @@ mod tests {
         assert!(allow_list_matches("ls -la", &list));
         assert!(allow_list_matches("  ls -la  ", &list));
         assert!(!allow_list_matches("rm -rf /", &list));
-        assert!(!allow_list_matches("cargo", &list)); // prefix needs space or exact
-        assert!(!allow_list_matches("cargocheck", &list) == false || true);
+        // Prefix requires trailing space or exact equality.
+        assert!(!allow_list_matches("cargo", &list));
+        // PR-I regression: a word-boundary-less `starts_with` would
+        // let `"cargocheck"` match `"cargo check"` (it doesn't — the
+        // entry has an internal space) and `"lsblk"` match `"ls"`.
+        assert!(!allow_list_matches("cargocheck", &list));
+    }
+
+    #[test]
+    fn allow_list_requires_word_boundary_not_raw_starts_with() {
+        // PR-I bug fix — previously the gate used a raw `starts_with`
+        // which would auto-approve `ls`-prefixed commands like
+        // `lsblk`, `lsof`, `lsattr`, silently bypassing the confirm
+        // modal. This asserts the legacy
+        // `tools::cmd_matches_prefix` behaviour: the allow-list entry
+        // must be followed by a space or be an exact match.
+        let list = vec!["ls".to_string(), "cat".to_string(), "find".to_string()];
+        // Legitimate allow-list hits.
+        assert!(allow_list_matches("ls", &list));
+        assert!(allow_list_matches("ls -la", &list));
+        assert!(allow_list_matches("cat README.md", &list));
+        assert!(allow_list_matches("find . -name '*.rs'", &list));
+        // Must NOT leak through to a different binary that happens
+        // to share a prefix.
+        assert!(!allow_list_matches("lsblk", &list));
+        assert!(!allow_list_matches("lsof", &list));
+        assert!(!allow_list_matches("lsattr", &list));
+        assert!(!allow_list_matches("catfish /tmp/evil", &list));
+        assert!(!allow_list_matches("findmnt", &list));
     }
 
     #[test]
@@ -808,6 +869,20 @@ mod tests {
         let list = vec!["".to_string(), "cargo".to_string()];
         assert!(allow_list_matches("cargo run", &list));
         assert!(!allow_list_matches("rm -rf /", &list));
+    }
+
+    #[test]
+    fn allow_list_ignores_whitespace_only_entries() {
+        // Whitespace-only entries (`"   "`) also must not match
+        // everything. `trim()` + empty-check covers this.
+        let list = vec![
+            "   ".to_string(),
+            "\t".to_string(),
+            "cargo".to_string(),
+        ];
+        assert!(allow_list_matches("cargo run", &list));
+        assert!(!allow_list_matches("rm -rf /", &list));
+        assert!(!allow_list_matches("   ", &list));
     }
 
     // --- tail_for_log ------------------------------------------------------
@@ -841,7 +916,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_empty_cmd_returns_skipped() {
-        let r = execute_run_cmd(None, None, ".", "   ", None).await.unwrap();
+        let r = execute_run_cmd(None, None, ".", "   ", None, None)
+            .await
+            .unwrap();
         assert_eq!(r.status, ExecutionStatus::Skipped);
         assert!(r.classification.is_none());
         assert!(r.decision.is_none());
@@ -850,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn execute_dangerous_refuses_without_spawn() {
         // No AppState → defaults (warning_mode=prompt, dangerous_policy=refuse).
-        let r = execute_run_cmd(None, None, ".", "rm -rf /", None)
+        let r = execute_run_cmd(None, None, ".", "rm -rf /", None, None)
             .await
             .unwrap();
         assert_eq!(r.status, ExecutionStatus::RefusedDangerous);
@@ -877,6 +954,7 @@ mod tests {
             None,
             &project_dir_str,
             "echo hello_from_gate",
+            None,
             None,
         )
         .await
@@ -908,10 +986,80 @@ mod tests {
         // Warning class with no AppHandle/State → the gate cannot
         // surface a modal; it falls through the safe path as
         // UserDenied (not Executed, not Refused).
-        let r = execute_run_cmd(None, None, ".", "npm install foo", None)
+        let r = execute_run_cmd(None, None, ".", "npm install foo", None, None)
             .await
             .unwrap();
         assert_eq!(r.decision, Some(Decision::Prompt));
         assert_eq!(r.status, ExecutionStatus::UserDenied);
+    }
+
+    #[tokio::test]
+    async fn execute_autonomous_confirm_override_upgrades_safe_to_prompt() {
+        // PR-I regression: `Some(true)` override must upgrade an
+        // otherwise AutoRun (Safe) command to Prompt, even when
+        // there is no AppState and the persisted setting defaults to
+        // false. With no UI available the prompt falls through to
+        // UserDenied — the key invariant is that we did NOT
+        // auto-execute.
+        let r = execute_run_cmd(
+            None,
+            None,
+            ".",
+            "echo hello",
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.decision,
+            Some(Decision::Prompt),
+            "per-request override must force Prompt for Safe cmds"
+        );
+        assert_eq!(r.status, ExecutionStatus::UserDenied);
+        assert_ne!(r.status, ExecutionStatus::Executed);
+    }
+
+    #[tokio::test]
+    async fn execute_autonomous_confirm_override_false_lets_safe_autorun() {
+        // Mirror of the test above: `Some(false)` must NOT promote
+        // Safe → Prompt, so the `echo` command executes through
+        // `run_cmd_impl` and yields exit_code=0.
+        let project_dir = std::env::temp_dir();
+        let project_dir_str = project_dir.to_string_lossy().to_string();
+        let r = execute_run_cmd(
+            None,
+            None,
+            &project_dir_str,
+            "echo override_false",
+            None,
+            Some(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.decision, Some(Decision::AutoRun));
+        assert_eq!(r.status, ExecutionStatus::Executed);
+        assert_eq!(r.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_autonomous_confirm_override_none_falls_back_to_settings() {
+        // `None` → read from settings. With no AppState → fallback
+        // default is `false` (see the match arm in `execute_run_cmd`),
+        // so a Safe command should AutoRun normally.
+        let project_dir = std::env::temp_dir();
+        let project_dir_str = project_dir.to_string_lossy().to_string();
+        let r = execute_run_cmd(
+            None,
+            None,
+            &project_dir_str,
+            "echo override_none",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.decision, Some(Decision::AutoRun));
+        assert_eq!(r.status, ExecutionStatus::Executed);
     }
 }

@@ -1671,12 +1671,19 @@ pub async fn run_codegen_envelope(
 
             if security_gate_execute_enabled {
                 let goal_cancel = state.goal_cancelled.clone();
+                // Thread the per-request `autonomous_confirm` flag
+                // through as an override so a one-off request can
+                // demand the confirm modal regardless of the
+                // persisted `autonomous_confirm_irreversible`
+                // setting. PR-I fix for Devin Review PR-H comment
+                // #3120677225.
                 match run_cmd_gate::execute_run_cmd(
                     Some(&app),
                     Some(state.inner()),
                     &project_dir,
                     &cmd,
                     Some(&goal_cancel),
+                    Some(autonomous_confirm),
                 )
                 .await
                 {
