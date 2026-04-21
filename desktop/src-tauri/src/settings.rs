@@ -206,6 +206,30 @@ pub struct Settings {
     /// on it; Phase 2.B will consume it.
     #[serde(default = "default_security_gate_warning_mode")]
     pub security_gate_warning_mode: String,
+    /// Phase 2.B — when true, `run_codegen_envelope` will execute a
+    /// surfaced `run_cmd` through the Phase 2.A classifier gate after
+    /// the compiler gate + sandbox commit succeed. Defaults to
+    /// **false** because no UI panel exists yet (§VI.2 / §VI.3) to
+    /// render execution results; the envelope still surfaces `run_cmd`
+    /// + classification as today when this toggle is off. Flip to
+    /// `true` to opt into Phase 2.B execution.
+    #[serde(default)]
+    pub security_gate_execute_enabled: bool,
+    /// Phase 2.B — hard wall-clock timeout in milliseconds for a
+    /// single `run_cmd` execution. The command is killed (SIGKILL on
+    /// Unix, TerminateJobObject on Windows) if it exceeds this
+    /// budget. Defaults to 2 minutes, matching typical
+    /// `npm test` / `bun run build` durations on cold caches.
+    #[serde(default = "default_security_gate_execute_timeout_ms")]
+    pub security_gate_execute_timeout_ms: u64,
+    /// Phase 2.B — policy for classifier-Dangerous commands:
+    /// `"refuse"` (default) hard-blocks execution and emits
+    /// `run_cmd.refused`; `"prompt"` routes the command through the
+    /// same confirm modal as Warning (so a human can override).
+    /// Safe and Warning decisions are governed by
+    /// `security_gate_warning_mode` + allow-list, not this setting.
+    #[serde(default = "default_security_gate_dangerous_policy")]
+    pub security_gate_dangerous_policy: String,
 }
 
 fn default_true() -> bool {
@@ -264,6 +288,20 @@ fn default_security_gate_warning_mode() -> String {
     // this, but we persist the value now so users' preferences
     // survive across sessions before execution is wired up.
     "prompt".to_string()
+}
+fn default_security_gate_execute_timeout_ms() -> u64 {
+    // V6 §V.3 — 2-minute wall clock covers `npm test`, `bun run build`,
+    // and most dev-time verification commands. Users can raise this
+    // from Settings; kill is enforced by `tools::run_cmd_impl` which
+    // already times out and reaps children safely.
+    120_000
+}
+fn default_security_gate_dangerous_policy() -> String {
+    // V6 §VII.2 — Dangerous is refuse-by-default. The classifier
+    // flags exactly the irreversible / credential-stealing / shell
+    // injection patterns; relaxing to "prompt" requires an explicit
+    // user opt-in from Settings.
+    "refuse".to_string()
 }
 fn default_context_compaction_keep_last() -> u32 {
     // 20 UI messages ≈ 10 user/assistant pairs. Comfortable for
@@ -332,6 +370,9 @@ impl Default for Settings {
             dependency_guard_mode: default_dependency_guard_mode(),
             security_gate_enabled: true,
             security_gate_warning_mode: default_security_gate_warning_mode(),
+            security_gate_execute_enabled: false,
+            security_gate_execute_timeout_ms: default_security_gate_execute_timeout_ms(),
+            security_gate_dangerous_policy: default_security_gate_dangerous_policy(),
         }
     }
 }

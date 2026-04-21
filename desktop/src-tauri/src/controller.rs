@@ -27,6 +27,7 @@ use crate::compiler_gate::{self, CompileOutcome};
 use crate::dependency_guard::{self, GuardOutcome};
 use crate::fs_ops;
 use crate::project_scan;
+use crate::run_cmd_gate;
 use crate::security_gate;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
 use crate::AppState;
@@ -1129,6 +1130,14 @@ pub struct AppliedEnvelope {
     /// earlier: "parse + validate only, no execution, only surface as
     /// metadata"). Phase 2 security gate will decide execution policy.
     pub run_cmd: Option<String>,
+    /// Phase 2.B — populated when `security_gate_execute_enabled` is
+    /// on and the envelope carries a `run_cmd`. `None` when execution
+    /// is disabled, the envelope has no `run_cmd`, or the command was
+    /// whitespace. Callers (UI + §V.3 runtime validation) inspect
+    /// `status` to tell Executed from RefusedDangerous / UserDenied /
+    /// BlockedByPolicy / ConfirmTimedOut / Skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<run_cmd_gate::ExecutionResult>,
 }
 
 /// Write every file in a validated [`CodegenEnvelope`] to disk through
@@ -1203,6 +1212,7 @@ pub fn apply_codegen_envelope(
         applied,
         failed,
         run_cmd: envelope.run_cmd.clone(),
+        execution: None,
     }
 }
 
@@ -1296,6 +1306,7 @@ pub async fn run_codegen_envelope(
         dep_guard_mode,
         security_gate_enabled,
         security_gate_warning_mode,
+        security_gate_execute_enabled,
     ) = {
         let s = state.read_settings();
         (
@@ -1306,6 +1317,7 @@ pub async fn run_codegen_envelope(
             s.dependency_guard_mode.clone(),
             s.security_gate_enabled,
             s.security_gate_warning_mode.clone(),
+            s.security_gate_execute_enabled,
         )
     };
 
@@ -1598,7 +1610,7 @@ pub async fn run_codegen_envelope(
     let envelope = applied_envelope
         .ok_or_else(|| "compiler gate: exited loop without promoting an envelope".to_string())?;
 
-    let result = apply_codegen_envelope(&app, &project_dir, &envelope);
+    let mut result = apply_codegen_envelope(&app, &project_dir, &envelope);
     if !result.failed.is_empty() {
         let summary = result
             .failed
@@ -1625,14 +1637,23 @@ pub async fn run_codegen_envelope(
 
     // Phase 2.A (V6 §VII.2) — classify any surfaced `run_cmd` and
     // emit a `security.classified` event so the UI can render risk
-    // before Phase 2.B wires up actual execution. We do NOT execute
-    // the command here; the event is informational only. The
-    // classifier is deterministic (same input → same output) and has
-    // no side effects, so it's safe to run unconditionally when
-    // `run_cmd` is present.
+    // before Phase 2.B wires up actual execution. The classifier is
+    // deterministic (same input → same output) and has no side
+    // effects, so it's safe to run unconditionally when `run_cmd` is
+    // present.
+    //
+    // Phase 2.B (V6 §VII.2 + §V.3 hook) — when
+    // `security_gate_execute_enabled` is on, we hand the classified
+    // command to `run_cmd_gate::execute_run_cmd` which replays the
+    // classification through the policy layer (Safe/AutoRun,
+    // Warning/prompt-or-allow-or-block with allow-list + autonomous
+    // override, Dangerous/refuse-or-prompt) and, if greenlit,
+    // dispatches through the existing `tools::run_cmd_impl` runner.
+    // This reuses the in-production child-spawn + cancel + tree-kill
+    // machinery — no new execution engine.
     if security_gate_enabled {
-        if let Some(cmd) = result.run_cmd.as_deref() {
-            let classification = security_gate::classify(cmd);
+        if let Some(cmd) = result.run_cmd.clone() {
+            let classification = security_gate::classify(&cmd);
             let _ = app.emit(
                 "ai:step",
                 json!({
@@ -1647,6 +1668,40 @@ pub async fn run_codegen_envelope(
                     "run_cmd": cmd,
                 }),
             );
+
+            if security_gate_execute_enabled {
+                let goal_cancel = state.goal_cancelled.clone();
+                match run_cmd_gate::execute_run_cmd(
+                    Some(&app),
+                    Some(state.inner()),
+                    &project_dir,
+                    &cmd,
+                    Some(&goal_cancel),
+                )
+                .await
+                {
+                    Ok(exec) => {
+                        result.execution = Some(exec);
+                    }
+                    Err(e) => {
+                        // Infra-level failure (invalid project root,
+                        // spawn error). Surface as a step event but do
+                        // not fail the envelope — the files are already
+                        // on disk and the user can retry the command
+                        // manually from the terminal panel.
+                        let _ = app.emit(
+                            "ai:step",
+                            json!({
+                                "role": "execution",
+                                "label": "run_cmd.error",
+                                "status": "error",
+                                "error": e,
+                                "cmd": cmd,
+                            }),
+                        );
+                    }
+                }
+            }
         }
     }
 

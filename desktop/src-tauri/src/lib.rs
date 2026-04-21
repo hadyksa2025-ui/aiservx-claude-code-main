@@ -28,6 +28,7 @@ mod dependency_guard;
 mod fs_ops;
 mod memory;
 mod project_scan;
+mod run_cmd_gate;
 mod security_gate;
 mod settings;
 mod tasks;
@@ -168,6 +169,7 @@ pub fn run() {
             controller::cancel_goal,
             controller::run_codegen_envelope,
             controller::classify_run_cmd,
+            run_cmd_gate::execute_classified_run_cmd,
             project_scan::scan_project_cmd,
             tasks::load_task_tree,
             tasks::load_failures_log,
