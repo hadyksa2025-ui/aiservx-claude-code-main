@@ -1,5 +1,0 @@
-$env:CLAUDE_CODE_USE_OLLAMA = "1"
-$env:OLLAMA_MODEL = "llama3.2:1b"
-$env:OLLAMA_BASE_URL = "http://localhost:11434"
-$env:ANTHROPIC_API_KEY = "ollama-dummy-key"
-& "C:\Users\sd\.bun\bin\bun.exe" run ./src/entrypoints/cli.tsx -p "Hello"
