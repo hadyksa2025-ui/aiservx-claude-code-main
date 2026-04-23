@@ -10,6 +10,7 @@ import {
 import type { AgentRole, ChatMessage, StepEvent } from "../types";
 import { useAppStore } from "../store";
 import { FinalAnswerBubble } from "./FinalAnswerBubble";
+import { PipelineMessageList } from "./PipelineMessageList";
 import { SystemAction } from "./SystemAction";
 import { ThinkingBlock } from "./ThinkingBlock";
 
@@ -89,6 +90,7 @@ export function Chat({ projectDir, disabled }: Props) {
   const messages = useAppStore((s) => s.messages);
   const setMessages = useAppStore((s) => s.setMessages);
   const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
+  const resetPipeline = useAppStore((s) => s.resetPipeline);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -248,6 +250,12 @@ export function Chat({ projectDir, disabled }: Props) {
       content: input.trim(),
     };
     const historyForCall = messages.filter((m) => !m.streaming);
+    // OC-Titan §VI.2/§VI.3 — reset pipeline slice at the **start** of a
+    // new turn, not on the first event. This keeps phase at `idle` if
+    // the backend takes a while before emitting anything, and prevents
+    // cross-turn event mixing when a previous turn's terminal event
+    // lands late.
+    resetPipeline();
     setMessages([...messages, userMsg]);
     setInput("");
     setSending(true);
@@ -319,7 +327,7 @@ export function Chat({ projectDir, disabled }: Props) {
     } finally {
       setSending(false);
     }
-  }, [input, messages, projectDir, sending, setMessages]);
+  }, [input, messages, projectDir, sending, setMessages, resetPipeline]);
 
   const tiers = useMemo(() => classifyMessages(messages), [messages]);
 
@@ -334,6 +342,14 @@ export function Chat({ projectDir, disabled }: Props) {
         {messages.map((m, i) =>
           renderMessage(m, tiers[i], () => setSettingsOpen(true)),
         )}
+        {/*
+         * OC-Titan §VI.2/§VI.3 — pipeline events render as a thin
+         * strip beneath the chat transcript. It only shows content
+         * when the current turn has produced any guard / compiler /
+         * security / autoinstall / execution / runtime events; when
+         * the pipeline is idle the list renders nothing.
+         */}
+        <PipelineMessageList />
         {sending && !messages.some((m) => m.streaming) && (
           <div className="thinking-block is-streaming role-executor">
             <div className="tb-header">

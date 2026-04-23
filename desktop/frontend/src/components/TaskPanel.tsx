@@ -37,6 +37,11 @@ export function TaskPanel({ projectDir, disabled }: Props) {
   // lightweight chip here so the pane isn't silent for the 2+ minute
   // pre-execution window on small local models.
   const goalPlanning = useAppStore((s) => s.goalPlanning);
+  // OC-Titan §VI.2/§VI.3 — pipeline state-machine slice.
+  const pipelinePhase = useAppStore((s) => s.pipelinePhase);
+  const pipelineAttempt = useAppStore((s) => s.pipelineAttempt);
+  const pipelineLastLabel = useAppStore((s) => s.pipelineLastLabel);
+  const resetPipeline = useAppStore((s) => s.resetPipeline);
 
   // Load any previously-persisted active tree and failures log when the
   // project opens.
@@ -191,6 +196,11 @@ export function TaskPanel({ projectDir, disabled }: Props) {
     setRunState("running");
     setSummary(null);
     setCircuitTripped(null);
+    // OC-Titan §VI.2/§VI.3 — reset pipeline slice at the start of a
+    // new goal turn, so the state machine starts cleanly at `idle`
+    // and stale events from a prior run are not rendered under the
+    // new goal.
+    resetPipeline();
     try {
       await api.startGoal(projectDir, goal.trim());
     } catch (e) {
@@ -198,7 +208,7 @@ export function TaskPanel({ projectDir, disabled }: Props) {
       setSummary(`Goal failed: ${String(e)}`);
       runningRef.current = false;
     }
-  }, [projectDir, goal]);
+  }, [projectDir, goal, resetPipeline]);
 
   const cancelGoal = useCallback(async () => {
     try {
@@ -301,6 +311,31 @@ export function TaskPanel({ projectDir, disabled }: Props) {
           {goalPlanning === "scanning"
             ? "Scanning project…"
             : "Planner drafting task list…"}
+        </div>
+      )}
+
+      {pipelinePhase !== "idle" && (
+        <div
+          className={`task-pipeline-chip task-pipeline-chip-${pipelinePhase}`}
+          role="status"
+          aria-live="polite"
+          title={
+            pipelineLastLabel
+              ? `last event: ${pipelineLastLabel} · attempt ${pipelineAttempt}`
+              : `pipeline phase: ${pipelinePhase}`
+          }
+        >
+          <span className="task-pipeline-label">
+            pipeline: {pipelinePhase.replace("_", " ")}
+          </span>
+          {pipelineAttempt > 0 && (
+            <span className="task-pipeline-attempt">
+              · attempt {pipelineAttempt}
+            </span>
+          )}
+          {pipelineLastLabel && (
+            <span className="task-pipeline-last">· {pipelineLastLabel}</span>
+          )}
         </div>
       )}
 

@@ -4,10 +4,12 @@ import { api, onEvent } from "./api";
 import type {
   AgentRole,
   FsChange,
+  PipelineStepEvent,
   StepEvent,
   ToolCall,
   ToolResult,
 } from "./types";
+import { isPipelineRole } from "./types";
 import { Explorer } from "./components/Explorer";
 import { Chat } from "./components/Chat";
 import { Execution } from "./components/Execution";
@@ -49,6 +51,7 @@ export default function App() {
   const settingsOpen = useAppStore((s) => s.settingsOpen);
   const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
   const setGoalPlanning = useAppStore((s) => s.setGoalPlanning);
+  const pushPipelineEvent = useAppStore((s) => s.pushPipelineEvent);
 
   const [bottomTab, setBottomTab] = useState<"debug" | "terminal" | "failures">(
     "terminal",
@@ -90,6 +93,30 @@ export default function App() {
         pushEvent({ kind: "step", step: p, at: Date.now() }),
       ),
     );
+    // OC-Titan §VI.2/§VI.3 — pipeline events arrive on the same
+    // `ai:step` channel but carry a distinct payload shape
+    // (`{role, label, status, ...}`). We discriminate by role
+    // membership + presence of a string `label`; everything else
+    // keeps flowing into the legacy execution log above.
+    unlistens.push(
+      onEvent<Record<string, unknown>>("ai:step", (raw) => {
+        if (!raw || typeof raw !== "object") return;
+        const role = (raw as { role?: unknown }).role;
+        const label = (raw as { label?: unknown }).label;
+        const status = (raw as { status?: unknown }).status;
+        if (!isPipelineRole(role)) return;
+        if (typeof label !== "string") return;
+        if (
+          status !== "running" &&
+          status !== "done" &&
+          status !== "failed" &&
+          status !== "warning"
+        ) {
+          return;
+        }
+        pushPipelineEvent(raw as unknown as PipelineStepEvent);
+      }),
+    );
     unlistens.push(
       onEvent<{ message: string; role?: AgentRole }>("ai:error", (p) =>
         pushError(p.message, p.role),
@@ -122,7 +149,14 @@ export default function App() {
         void p.then((fn) => fn());
       }
     };
-  }, [pushEvent, pushError, pushFailure, bumpFsTick, setGoalPlanning]);
+  }, [
+    pushEvent,
+    pushError,
+    pushFailure,
+    bumpFsTick,
+    setGoalPlanning,
+    pushPipelineEvent,
+  ]);
 
   // Load (and scope) failures per project. We also clear local failures
   // on project close.
