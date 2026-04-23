@@ -134,12 +134,11 @@ pub struct ExecutionResult {
 }
 
 impl ExecutionResult {
-    /// Public-in-crate constructor for a short-circuit
-    /// `ExecutionStatus::Skipped` result. Used by the Phase 2.C
-    /// [`autoinstall`](crate::autoinstall) module's unit tests and
-    /// by downstream callers that synthesise a skipped result
-    /// without going through [`execute_run_cmd`].
-    pub(crate) fn skipped(reason: impl Into<String>) -> Self {
+    /// Short-circuit constructor for an `ExecutionStatus::Skipped`
+    /// result — used internally by [`execute_run_cmd`] when the gate
+    /// exits before reaching `run_cmd_impl` (empty command, missing
+    /// [`AppState`], classifier refusal, etc.).
+    fn skipped(reason: impl Into<String>) -> Self {
         ExecutionResult {
             exit_code: -1,
             duration_ms: 0,
