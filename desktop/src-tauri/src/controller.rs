@@ -1449,6 +1449,11 @@ pub async fn run_codegen_envelope(
                 // refused, denied, non-zero exit, still-missing
                 // after install) falls back to the classic reprompt
                 // path below.
+                // PR-M hotfix (BUG-L2): thread the goal-level
+                // `CancelToken` so a user-initiated cancel aborts
+                // the install mid-flight (spawn + confirm modal)
+                // instead of waiting out the timeout wall-clock.
+                let goal_cancel = state.goal_cancelled.clone();
                 let fix_forward = autoinstall::try_fix_forward(
                     &app,
                     state.inner(),
@@ -1462,18 +1467,23 @@ pub async fn run_codegen_envelope(
                     &dep_guard_mode,
                     autonomous_confirm,
                     attempt,
+                    Some(&goal_cancel),
                 )
                 .await;
 
                 if let FixForwardResult::Resolved = fix_forward {
-                    // Fix-forward win: same attempt continues to the
-                    // compiler gate with the original envelope. We
-                    // clone rather than move because the enclosing
-                    // match arm binds `missing` by reference, and
-                    // the compiler gate path below also reads from
-                    // `turn.envelope` — cloning keeps both borrows
-                    // sound without reshaping the outer match.
-                    envelope_for_apply = Some(turn.envelope.clone());
+                    // Fix-forward win: the install closed the
+                    // `dependency.missing` loop in zero retry slots.
+                    // Intentionally do **not** set
+                    // `envelope_for_apply` here — fall through to
+                    // the compiler gate, which owns the invariant
+                    // that `envelope_for_apply` is `Some` only when
+                    // `tsc --noEmit` reports a clean build (or is
+                    // explicitly skipped via policy). PR-M hotfix
+                    // for BUG-L1: pre-setting it caused an envelope
+                    // with `CompileOutcome::Errors` to bypass the
+                    // retry-via-`continue` branch and get written
+                    // to disk unchanged.
                 } else {
                     // Fall back to the classic reprompt path. This
                     // mirrors pre-2.C behaviour exactly — autoinstall

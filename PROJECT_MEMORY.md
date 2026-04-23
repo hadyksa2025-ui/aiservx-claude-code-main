@@ -2914,6 +2914,48 @@ new one specific to installs:
   confirm modal for WARNING installs is already in production
   from Phase 2.B).
 
+### §19.10 PR-M hotfix (post-merge review fixes)
+
+Three issues surfaced in Devin Review on merged PR-L and were
+addressed in a follow-up hotfix PR:
+
+* **BUG-L1 (critical) — `envelope_for_apply` bypass.** In
+  `controller::run_codegen_envelope`, the
+  `FixForwardResult::Resolved` arm was pre-setting
+  `envelope_for_apply = Some(turn.envelope.clone())`. Because
+  the compiler-gate error arms (`CompileOutcome::Errors /
+  Timeout / Failed`) do not reset it to `None` before
+  `continue`-ing the retry loop, a clean autoinstall followed
+  by a compile error would have caused the broken envelope to
+  be written to disk at line 1678
+  (`let Some(envelope) = envelope_for_apply else { continue; }`).
+  Fix: delete the premature assignment. The Resolved path now
+  falls through with `envelope_for_apply = None`, letting the
+  compiler gate own the invariant it already documents at
+  line 1344 — *"`Some(..)` only when guard + compile gate both
+  pass (or cleanly skip)."*
+
+* **BUG-L2 — missing cancel token in autoinstall.**
+  `autoinstall::try_fix_forward` was calling
+  `run_cmd_gate::execute_run_cmd(... cancel: None ...)`. A
+  goal-level cancel would only be observed after the wall-clock
+  `security_gate_execute_timeout_ms` fired. Fix: thread the
+  controller's `state.goal_cancelled.clone()` through a new
+  `cancel: Option<&CancelToken>` parameter on
+  `try_fix_forward`, matching the other `execute_run_cmd`
+  callers.
+
+* **L3 — `ExecutionResult::skipped` visibility drift.** PR-L
+  promoted the constructor to `pub(crate)` with a doc comment
+  claiming use by "the Phase 2.C autoinstall module's unit
+  tests". No such callers materialised. Fix: revert to private
+  and rewrite the doc to describe its actual role (internal
+  short-circuit for empty / stateless / refused calls).
+
+No behavioural change is visible when `autoinstall_enabled` is
+`false` (the default). The fix matters only for users who have
+opted into the full self-healing pipeline.
+
 ---
 
 *If something here is wrong or incomplete, fix it in-place rather than

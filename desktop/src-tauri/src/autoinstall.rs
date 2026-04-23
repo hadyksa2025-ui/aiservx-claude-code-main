@@ -71,6 +71,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::codegen_envelope::CodegenEnvelope;
+use crate::cancel::CancelToken;
 use crate::dependency_guard::{self, GuardOutcome};
 use crate::run_cmd_gate::{self, ExecutionStatus};
 use crate::AppState;
@@ -328,6 +329,7 @@ pub async fn try_fix_forward(
     dep_guard_mode: &str,
     autonomous_confirm: bool,
     attempt: u32,
+    cancel: Option<&CancelToken>,
 ) -> FixForwardResult {
     // ---- Pre-flight skips (no side effects) ----
     if !autoinstall_enabled {
@@ -413,12 +415,18 @@ pub async fn try_fix_forward(
     // Use the same autonomous-confirm override the controller
     // threads to every other `execute_run_cmd` call so a one-off
     // non-autonomous turn can still see the confirm modal.
+    // Thread the goal-level `CancelToken` through to
+    // `run_cmd_gate::execute_run_cmd` so a user-initiated goal cancel
+    // aborts the install process (via `run_cmd_impl` + the confirm
+    // modal) instead of waiting out the wall-clock timeout. PR-M
+    // hotfix for BUG-L2 — earlier PR-L passed `None` here and the
+    // cancel was only observed after the timeout fired.
     let exec = match run_cmd_gate::execute_run_cmd(
         Some(app),
         Some(state),
         project_dir,
         &cmd,
-        None,
+        cancel,
         Some(autonomous_confirm),
     )
     .await
