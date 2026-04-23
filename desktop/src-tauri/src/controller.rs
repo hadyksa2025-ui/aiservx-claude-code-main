@@ -22,6 +22,7 @@ use tokio::time::{sleep, timeout};
 use tracing::warn;
 
 use crate::ai::{self, UiMessage};
+use crate::autoinstall::{self, FixForwardResult};
 use crate::codegen_envelope::{CodegenEnvelope, EnvelopeFile};
 use crate::compiler_gate::{self, CompileOutcome};
 use crate::dependency_guard::{self, GuardOutcome};
@@ -1309,6 +1310,8 @@ pub async fn run_codegen_envelope(
         security_gate_warning_mode,
         security_gate_execute_enabled,
         runtime_validation_enabled,
+        autoinstall_enabled,
+        autoinstall_package_manager,
     ) = {
         let s = state.read_settings();
         (
@@ -1321,6 +1324,8 @@ pub async fn run_codegen_envelope(
             s.security_gate_warning_mode.clone(),
             s.security_gate_execute_enabled,
             s.runtime_validation_enabled,
+            s.autoinstall_enabled,
+            s.autoinstall_package_manager.clone(),
         )
     };
     // §V.3 is gated on execution itself — if Phase 2.B is off there's
@@ -1432,27 +1437,76 @@ pub async fn run_codegen_envelope(
                         "missing": missing,
                     }),
                 );
-                if attempt + 1 >= max_attempts {
-                    return Err(format!(
-                        "dependency guard: envelope imports {} unresolved package(s) after {} attempt(s):\n{feedback}",
-                        missing.len(),
-                        attempt + 1,
-                    ));
+
+                // ---- Phase 2.C fix-forward auto-install ----
+                // Before we burn a retry slot on a reprompt, try to
+                // synthesise a deterministic `bun add <pkgs>` /
+                // `npm install <pkgs>` command and route it through
+                // the existing Phase 2.A classifier + Phase 2.B
+                // executor. On a clean re-check we promote the
+                // current envelope to the compiler gate without
+                // consuming a slot. Any failure mode (disabled,
+                // refused, denied, non-zero exit, still-missing
+                // after install) falls back to the classic reprompt
+                // path below.
+                let fix_forward = autoinstall::try_fix_forward(
+                    &app,
+                    state.inner(),
+                    &project_dir,
+                    &turn.envelope,
+                    missing,
+                    autoinstall_enabled,
+                    &autoinstall_package_manager,
+                    security_gate_execute_enabled,
+                    dep_guard_enabled,
+                    &dep_guard_mode,
+                    autonomous_confirm,
+                    attempt,
+                )
+                .await;
+
+                if let FixForwardResult::Resolved = fix_forward {
+                    // Fix-forward win: same attempt continues to the
+                    // compiler gate with the original envelope. We
+                    // clone rather than move because the enclosing
+                    // match arm binds `missing` by reference, and
+                    // the compiler gate path below also reads from
+                    // `turn.envelope` — cloning keeps both borrows
+                    // sound without reshaping the outer match.
+                    envelope_for_apply = Some(turn.envelope.clone());
+                } else {
+                    // Fall back to the classic reprompt path. This
+                    // mirrors pre-2.C behaviour exactly — autoinstall
+                    // is a strictly additive, opt-in capability.
+                    if attempt + 1 >= max_attempts {
+                        return Err(format!(
+                            "dependency guard: envelope imports {} unresolved package(s) after {} attempt(s):\n{feedback}",
+                            missing.len(),
+                            attempt + 1,
+                        ));
+                    }
+                    let retry_reason = match &fix_forward {
+                        FixForwardResult::NotResolved { reason } => *reason,
+                        FixForwardResult::Resolved => "resolved", // unreachable
+                    };
+                    let _ = app.emit(
+                        "ai:step",
+                        json!({
+                            "role": "guard",
+                            "label": "dependency.retry",
+                            "status": "running",
+                            "attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "autoinstall_reason": retry_reason,
+                        }),
+                    );
+                    current_request = build_dependency_feedback_prompt(&original_request, &feedback);
+                    // Skip the compiler gate this iteration — we
+                    // already know the envelope is structurally
+                    // wrong and autoinstall didn't (or wasn't
+                    // allowed to) resolve it.
+                    continue;
                 }
-                let _ = app.emit(
-                    "ai:step",
-                    json!({
-                        "role": "guard",
-                        "label": "dependency.retry",
-                        "status": "running",
-                        "attempt": attempt + 1,
-                        "max_attempts": max_attempts,
-                    }),
-                );
-                current_request = build_dependency_feedback_prompt(&original_request, &feedback);
-                // Skip the compiler gate this iteration — we already
-                // know the envelope is structurally wrong.
-                continue;
             }
         }
         // ---- end Phase 1.C dependency guard ----

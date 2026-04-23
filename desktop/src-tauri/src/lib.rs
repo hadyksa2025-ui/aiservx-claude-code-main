@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod ai;
+mod autoinstall;
 mod cancel;
 mod codegen_envelope;
 mod compiler_gate;
