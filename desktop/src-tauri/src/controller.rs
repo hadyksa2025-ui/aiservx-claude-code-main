@@ -28,6 +28,7 @@ use crate::dependency_guard::{self, GuardOutcome};
 use crate::fs_ops;
 use crate::project_scan;
 use crate::run_cmd_gate;
+use crate::runtime_validation::{self, RuntimeOutcome};
 use crate::security_gate;
 use crate::tasks::{self, Task, TaskStatus, TaskTree};
 use crate::AppState;
@@ -1307,6 +1308,7 @@ pub async fn run_codegen_envelope(
         security_gate_enabled,
         security_gate_warning_mode,
         security_gate_execute_enabled,
+        runtime_validation_enabled,
     ) = {
         let s = state.read_settings();
         (
@@ -1318,16 +1320,27 @@ pub async fn run_codegen_envelope(
             s.security_gate_enabled,
             s.security_gate_warning_mode.clone(),
             s.security_gate_execute_enabled,
+            s.runtime_validation_enabled,
         )
     };
+    // §V.3 is gated on execution itself — if Phase 2.B is off there's
+    // literally nothing to validate, so the feature transparently
+    // no-ops regardless of the user's preference.
+    let runtime_validation_effective = runtime_validation_enabled && security_gate_execute_enabled;
 
     let original_request = user_request.clone();
     let mut current_request = user_request;
     let mut last_diagnostics: Option<String> = None;
     let max_attempts = max_compile_retries.saturating_add(1);
-    let mut applied_envelope: Option<CodegenEnvelope> = None;
+    let mut applied_result: Option<AppliedEnvelope> = None;
 
     for attempt in 0..max_attempts {
+        // Envelope chosen for this iteration, set when the dep-guard
+        // + compile gate both pass (or cleanly skip). `None` means
+        // the iteration already `continue`d to the next attempt via
+        // a gate miss and must not reach the apply/execute block.
+        let mut envelope_for_apply: Option<CodegenEnvelope> = None;
+
         let turn = ai::run_codegen_envelope_turn(
             app.clone(),
             state.inner(),
@@ -1455,11 +1468,10 @@ pub async fn run_codegen_envelope(
                     "attempt": attempt,
                 }),
             );
-            applied_envelope = Some(turn.envelope);
-            break;
-        }
+            envelope_for_apply = Some(turn.envelope);
+        } else {
 
-        let scratch = match compiler_gate::prepare_scratch(&project_dir, &turn.envelope).await {
+            let scratch = match compiler_gate::prepare_scratch(&project_dir, &turn.envelope).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = app.emit(
@@ -1487,28 +1499,26 @@ pub async fn run_codegen_envelope(
         );
 
         let project_path = std::path::Path::new(&project_dir);
-        let toolchain = match compiler_gate::detect_toolchain(project_path).await {
-            Some(t) => t,
-            None => {
-                let _ = app.emit(
-                    "ai:step",
-                    json!({
-                        "role": "compiler",
-                        "label": "compiler.skipped",
-                        "status": "done",
-                        "reason": "no_toolchain",
-                        "attempt": attempt,
-                    }),
-                );
-                // Best-effort cleanup, then promote anyway. This
-                // matches the skip_policy contract — the user has no
-                // tsc available, so the gate is a no-op.
-                let _ = scratch.cleanup().await;
-                applied_envelope = Some(turn.envelope);
-                break;
-            }
-        };
+        let toolchain_opt = compiler_gate::detect_toolchain(project_path).await;
 
+        if toolchain_opt.is_none() {
+            let _ = app.emit(
+                "ai:step",
+                json!({
+                    "role": "compiler",
+                    "label": "compiler.skipped",
+                    "status": "done",
+                    "reason": "no_toolchain",
+                    "attempt": attempt,
+                }),
+            );
+            // Best-effort cleanup, then promote anyway. This matches
+            // the skip_policy contract — the user has no tsc
+            // available, so the gate is a no-op.
+            let _ = scratch.cleanup().await;
+            envelope_for_apply = Some(turn.envelope);
+        } else {
+        let toolchain = toolchain_opt.expect("checked is_none above");
         let _ = app.emit(
             "ai:step",
             json!({
@@ -1536,8 +1546,7 @@ pub async fn run_codegen_envelope(
                     }),
                 );
                 let _ = scratch.cleanup().await;
-                applied_envelope = Some(turn.envelope);
-                break;
+                envelope_for_apply = Some(turn.envelope);
             }
             CompileOutcome::Timeout {
                 toolchain: tc,
@@ -1605,109 +1614,228 @@ pub async fn run_codegen_envelope(
                 current_request = build_compile_feedback_prompt(&original_request, &feedback);
             }
         }
-    }
+        } // end `else` of `if toolchain_opt.is_none()` — tsc invocation block
+        } // end `else` of `if let Some(reason) = compiler_gate::skip_policy(...)`
 
-    let envelope = applied_envelope
-        .ok_or_else(|| "compiler gate: exited loop without promoting an envelope".to_string())?;
+        // If the compile gate set `envelope_for_apply`, promote the
+        // envelope now. Otherwise the compile gate emitted an
+        // `errors` diagnostic + queued a retry via `current_request`
+        // and we fall through to the next attempt.
+        let Some(envelope) = envelope_for_apply else {
+            continue;
+        };
 
-    let mut result = apply_codegen_envelope(&app, &project_dir, &envelope);
-    if !result.failed.is_empty() {
-        let summary = result
-            .failed
-            .iter()
-            .map(|(p, e)| format!("- {p}: {e}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!(
-            "codegen envelope partially failed: {}/{} files could not be written:\n{summary}",
-            result.failed.len(),
-            result.failed.len() + result.applied.len()
-        ));
-    }
-    let _ = app.emit(
-        "ai:step",
-        json!({
-            "role": "compiler",
-            "label": "compiler.promoted",
-            "status": "done",
-            "files": result.applied.len(),
-            "run_cmd": result.run_cmd,
-        }),
-    );
+        let mut result = apply_codegen_envelope(&app, &project_dir, &envelope);
+        if !result.failed.is_empty() {
+            let summary = result
+                .failed
+                .iter()
+                .map(|(p, e)| format!("- {p}: {e}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!(
+                "codegen envelope partially failed: {}/{} files could not be written:\n{summary}",
+                result.failed.len(),
+                result.failed.len() + result.applied.len()
+            ));
+        }
+        let _ = app.emit(
+            "ai:step",
+            json!({
+                "role": "compiler",
+                "label": "compiler.promoted",
+                "status": "done",
+                "attempt": attempt,
+                "files": result.applied.len(),
+                "run_cmd": result.run_cmd,
+            }),
+        );
 
-    // Phase 2.A (V6 §VII.2) — classify any surfaced `run_cmd` and
-    // emit a `security.classified` event so the UI can render risk
-    // before Phase 2.B wires up actual execution. The classifier is
-    // deterministic (same input → same output) and has no side
-    // effects, so it's safe to run unconditionally when `run_cmd` is
-    // present.
-    //
-    // Phase 2.B (V6 §VII.2 + §V.3 hook) — when
-    // `security_gate_execute_enabled` is on, we hand the classified
-    // command to `run_cmd_gate::execute_run_cmd` which replays the
-    // classification through the policy layer (Safe/AutoRun,
-    // Warning/prompt-or-allow-or-block with allow-list + autonomous
-    // override, Dangerous/refuse-or-prompt) and, if greenlit,
-    // dispatches through the existing `tools::run_cmd_impl` runner.
-    // This reuses the in-production child-spawn + cancel + tree-kill
-    // machinery — no new execution engine.
-    if security_gate_enabled {
-        if let Some(cmd) = result.run_cmd.clone() {
-            let classification = security_gate::classify(&cmd);
-            let _ = app.emit(
-                "ai:step",
-                json!({
-                    "role": "security",
-                    "label": "security.classified",
-                    "status": classification.class.as_event_status(),
-                    "class": classification.class,
-                    "reason": classification.reason,
-                    "matched_rule": classification.matched_rule,
-                    "compound": classification.compound,
-                    "warning_mode": security_gate_warning_mode,
-                    "run_cmd": cmd,
-                }),
-            );
+        // Phase 2.A (V6 §VII.2) — classify any surfaced `run_cmd` and
+        // emit a `security.classified` event so the UI can render risk
+        // before Phase 2.B wires up actual execution. The classifier is
+        // deterministic (same input → same output) and has no side
+        // effects, so it's safe to run unconditionally when `run_cmd`
+        // is present.
+        //
+        // Phase 2.B (V6 §VII.2 + §V.3 hook) — when
+        // `security_gate_execute_enabled` is on, we hand the classified
+        // command to `run_cmd_gate::execute_run_cmd` which replays the
+        // classification through the policy layer (Safe/AutoRun,
+        // Warning/prompt-or-allow-or-block with allow-list + autonomous
+        // override, Dangerous/refuse-or-prompt) and, if greenlit,
+        // dispatches through the existing `tools::run_cmd_impl` runner.
+        // This reuses the in-production child-spawn + cancel + tree-kill
+        // machinery — no new execution engine.
+        if security_gate_enabled {
+            if let Some(cmd) = result.run_cmd.clone() {
+                let classification = security_gate::classify(&cmd);
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "security",
+                        "label": "security.classified",
+                        "status": classification.class.as_event_status(),
+                        "class": classification.class,
+                        "reason": classification.reason,
+                        "matched_rule": classification.matched_rule,
+                        "compound": classification.compound,
+                        "warning_mode": security_gate_warning_mode,
+                        "run_cmd": cmd,
+                    }),
+                );
 
-            if security_gate_execute_enabled {
-                let goal_cancel = state.goal_cancelled.clone();
-                // Thread the per-request `autonomous_confirm` flag
-                // through as an override so a one-off request can
-                // demand the confirm modal regardless of the
-                // persisted `autonomous_confirm_irreversible`
-                // setting. PR-I fix for Devin Review PR-H comment
-                // #3120677225.
-                match run_cmd_gate::execute_run_cmd(
-                    Some(&app),
-                    Some(state.inner()),
-                    &project_dir,
-                    &cmd,
-                    Some(&goal_cancel),
-                    Some(autonomous_confirm),
-                )
-                .await
-                {
-                    Ok(exec) => {
-                        result.execution = Some(exec);
-                    }
-                    Err(e) => {
-                        // Infra-level failure (invalid project root,
-                        // spawn error). Surface as a step event but do
-                        // not fail the envelope — the files are already
-                        // on disk and the user can retry the command
-                        // manually from the terminal panel.
-                        let _ = app.emit(
-                            "ai:step",
-                            json!({
-                                "role": "execution",
-                                "label": "run_cmd.error",
-                                "status": "error",
-                                "error": e,
-                                "cmd": cmd,
-                            }),
-                        );
+                if security_gate_execute_enabled {
+                    let goal_cancel = state.goal_cancelled.clone();
+                    // Thread the per-request `autonomous_confirm`
+                    // flag through as an override so a one-off
+                    // request can demand the confirm modal regardless
+                    // of the persisted
+                    // `autonomous_confirm_irreversible` setting.
+                    // PR-I fix for Devin Review PR-H comment
+                    // #3120677225.
+                    match run_cmd_gate::execute_run_cmd(
+                        Some(&app),
+                        Some(state.inner()),
+                        &project_dir,
+                        &cmd,
+                        Some(&goal_cancel),
+                        Some(autonomous_confirm),
+                    )
+                    .await
+                    {
+                        Ok(exec) => {
+                            result.execution = Some(exec);
+                        }
+                        Err(e) => {
+                            // Infra-level failure (invalid project
+                            // root, spawn error). Surface as a step
+                            // event but do not fail the envelope —
+                            // the files are already on disk and the
+                            // user can retry the command manually
+                            // from the terminal panel.
+                            let _ = app.emit(
+                                "ai:step",
+                                json!({
+                                    "role": "execution",
+                                    "label": "run_cmd.error",
+                                    "status": "error",
+                                    "error": e,
+                                    "cmd": cmd,
+                                }),
+                            );
+                        }
                     }
                 }
+            }
+        }
+
+        // ---- Phase §V.3 runtime validation ----
+        // Consumes `ExecutionResult.exit_code` + `stderr_tail` from
+        // Phase 2.B. Non-zero exit on `Executed` status reprompts
+        // the model with the tails attached and consumes one
+        // attempt from the shared `max_compile_retries` budget
+        // (same budget as the compiler gate + dependency guard).
+        // Every non-Executed status (refused / denied / blocked /
+        // skipped) short-circuits to `Skipped` so policy refusals
+        // cannot exhaust the retry budget on their own.
+        let runtime_outcome = runtime_validation::evaluate(
+            result.execution.as_ref(),
+            runtime_validation_effective,
+        );
+        match runtime_outcome {
+            RuntimeOutcome::Ok {
+                exit_code,
+                duration_ms,
+            } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "runtime",
+                        "label": "runtime.ok",
+                        "status": "done",
+                        "attempt": attempt,
+                        "exit_code": exit_code,
+                        "duration_ms": duration_ms,
+                    }),
+                );
+                applied_result = Some(result);
+                break;
+            }
+            RuntimeOutcome::Skipped { reason } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "runtime",
+                        "label": "runtime.skipped",
+                        "status": "skipped",
+                        "attempt": attempt,
+                        "reason": reason,
+                    }),
+                );
+                applied_result = Some(result);
+                break;
+            }
+            RuntimeOutcome::Errors {
+                exit_code,
+                stderr_tail,
+                stdout_tail,
+                duration_ms,
+            } => {
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "runtime",
+                        "label": "runtime.errors",
+                        "status": "failed",
+                        "attempt": attempt,
+                        "exit_code": exit_code,
+                        "duration_ms": duration_ms,
+                        "stderr_tail": stderr_tail,
+                        "stdout_tail": stdout_tail,
+                    }),
+                );
+                if attempt + 1 >= max_attempts {
+                    let _ = app.emit(
+                        "ai:step",
+                        json!({
+                            "role": "runtime",
+                            "label": "runtime.exhausted",
+                            "status": "failed",
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "exit_code": exit_code,
+                        }),
+                    );
+                    warn!(
+                        "runtime validation exhausted retries after {} attempt(s); stderr tail: {}",
+                        attempt + 1,
+                        truncate_for_log(&stderr_tail)
+                    );
+                    return Err(format!(
+                        "runtime validation: `run_cmd` exited with code {exit_code} after {} attempt(s):\nstderr: {}",
+                        attempt + 1,
+                        truncate_for_log(&stderr_tail)
+                    ));
+                }
+                let _ = app.emit(
+                    "ai:step",
+                    json!({
+                        "role": "runtime",
+                        "label": "runtime.retry",
+                        "status": "running",
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                    }),
+                );
+                last_diagnostics = Some(stderr_tail.clone());
+                current_request = runtime_validation::build_reprompt(
+                    &original_request,
+                    exit_code,
+                    &stderr_tail,
+                    &stdout_tail,
+                );
+                // Fall through to the next iteration.
             }
         }
     }
@@ -1716,7 +1844,8 @@ pub async fn run_codegen_envelope(
     // contains the most recent successful-repair feedback, which is
     // useful for post-mortem / failure-memory aggregation (V6 §III.1).
     let _ = last_diagnostics;
-    Ok(result)
+    applied_result
+        .ok_or_else(|| "codegen envelope loop exited without applying an envelope".to_string())
 }
 
 /// Phase 2.A (V6 §VII.2) — Tauri command that classifies a single

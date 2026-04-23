@@ -230,6 +230,16 @@ pub struct Settings {
     /// `security_gate_warning_mode` + allow-list, not this setting.
     #[serde(default = "default_security_gate_dangerous_policy")]
     pub security_gate_dangerous_policy: String,
+    /// Phase §V.3 — when `true`, a non-zero `run_cmd` exit after
+    /// Phase 2.B execution reprompts the model with the stderr /
+    /// stdout tails attached and consumes one attempt from the
+    /// shared `max_compile_retries` budget. Defaults to `false`:
+    /// requires `security_gate_execute_enabled=true` to have any
+    /// effect (nothing runs → nothing to validate), so users
+    /// opting into execution still have to opt into the self-healing
+    /// loop separately.
+    #[serde(default)]
+    pub runtime_validation_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -373,6 +383,7 @@ impl Default for Settings {
             security_gate_execute_enabled: false,
             security_gate_execute_timeout_ms: default_security_gate_execute_timeout_ms(),
             security_gate_dangerous_policy: default_security_gate_dangerous_policy(),
+            runtime_validation_enabled: false,
         }
     }
 }
