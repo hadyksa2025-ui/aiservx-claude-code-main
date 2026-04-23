@@ -240,6 +240,32 @@ pub struct Settings {
     /// loop separately.
     #[serde(default)]
     pub runtime_validation_enabled: bool,
+    /// OC-Titan Phase 2.C — enable fix-forward auto-install of
+    /// packages the [`dependency_guard`](crate::dependency_guard)
+    /// reports as missing. When on, the controller synthesises a
+    /// single `bun add` / `npm install` / `pnpm add` / `yarn add`
+    /// command from the miss list, routes it through the Phase 2.A
+    /// classifier and the Phase 2.B executor, then re-runs the
+    /// guard. Successful installs are **fix-forward** — they do not
+    /// burn a retry slot, the controller just continues with the
+    /// compiler gate. Failed installs fall back to the classic
+    /// reprompt path and consume one slot. Defaults to `false`:
+    /// requires `security_gate_execute_enabled=true` to have any
+    /// effect (the install command has to actually run) and
+    /// `dependency_guard_enabled=true` (nothing to auto-install
+    /// otherwise).
+    #[serde(default)]
+    pub autoinstall_enabled: bool,
+    /// Phase 2.C — package manager selection strategy for
+    /// auto-install. `"auto"` (default) probes the project root for
+    /// a lockfile (`bun.lock` / `bun.lockb` → bun, `pnpm-lock.yaml`
+    /// → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm) and
+    /// falls back to `bun` when no lockfile is present, matching the
+    /// rest of the repo's Bun-first defaults. Explicit overrides:
+    /// `"bun"`, `"npm"`, `"pnpm"`, `"yarn"`. Any other value is
+    /// treated as `"auto"`.
+    #[serde(default = "default_autoinstall_package_manager")]
+    pub autoinstall_package_manager: String,
 }
 
 fn default_true() -> bool {
@@ -284,6 +310,12 @@ fn default_max_compile_retries() -> u32 {
 }
 fn default_tsc_timeout_secs() -> u64 {
     120
+}
+fn default_autoinstall_package_manager() -> String {
+    // `"auto"` — probe lockfiles at call time, fall back to `bun`.
+    // The repo-level `AGENTS.md` / `CLAUDE.md` both declare Bun as
+    // the primary runtime, so the fallback mirrors that convention.
+    "auto".to_string()
 }
 fn default_dependency_guard_mode() -> String {
     // V6 §I.6 "Fail loudly if unresolved" — default to hard-fail so
@@ -384,6 +416,8 @@ impl Default for Settings {
             security_gate_execute_timeout_ms: default_security_gate_execute_timeout_ms(),
             security_gate_dangerous_policy: default_security_gate_dangerous_policy(),
             runtime_validation_enabled: false,
+            autoinstall_enabled: false,
+            autoinstall_package_manager: default_autoinstall_package_manager(),
         }
     }
 }

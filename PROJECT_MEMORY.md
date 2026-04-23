@@ -2683,5 +2683,238 @@ Three reasons, in decreasing order of importance:
 
 ---
 
+## §19. OC-Titan Phase 2.C — Fix-forward auto-install
+
+Phase 2.C closes the loop the [dependency guard](#15-oc-titan-phase-1c--dependency-guard)
+opened in Phase 1.C. When the guard reports
+`GuardOutcome::Missing`, instead of unconditionally burning a
+retry slot on a reprompt, the controller now synthesises a
+deterministic `bun add <pkgs>` / `npm install <pkgs>` command,
+routes it through the existing Phase 2.A classifier and Phase 2.B
+executor, and (on success) re-runs the guard. Successful installs
+are **fix-forward** — the current envelope continues to the
+compiler gate in the same attempt, with no retry slot consumed.
+All failure modes fall back to the classic reprompt path, which
+mirrors pre-2.C behaviour exactly.
+
+The work lives in [`desktop/src-tauri/src/autoinstall.rs`] (pure
+logic + orchestrator) and one new branch in
+[`controller.rs`] `run_codegen_envelope` (the `GuardOutcome::Missing`
+arm). No new execution engine, no new classifier, no new
+validator — Phase 2.C is composition.
+
+### §19.1 Lifecycle
+
+```
+envelope -> dep_guard -> Missing
+                         |
+                         v
+                  autoinstall::try_fix_forward
+                         |
+      +------------------+------------------+
+      v                  v                  v
+  [skipped]         [executed ok]      [failed / refused /
+  (disabled /           |                denied / blocked /
+   execute_            [re-check         timed-out / error]
+   disabled /          dep_guard]             |
+   no_missing /            |                  |
+   empty_after          ok / warned      NotResolved
+   _sanitize)           / skipped              |
+      |                    |                   |
+      |                 Resolved               |
+      |                    |                   |
+      +--------------------+-------------------+
+                         |
+                         v
+          +-- Resolved  ------- fall through to compiler gate
+          |                     (same attempt, NO slot consumed)
+          |
+          +-- NotResolved ----- max_attempts guard +
+                                dependency.retry event +
+                                reprompt + `continue`
+                                (consumes 1 slot)
+```
+
+### §19.2 Settings (new in §19)
+
+Two fields on `settings::Settings`, both `#[serde(default)]` so
+loading a pre-2.C config is fully backward-compatible:
+
+| field | type | default | meaning |
+| --- | --- | --- | --- |
+| `autoinstall_enabled` | `bool` | `false` | Master on/off switch. Requires `security_gate_execute_enabled=true` (cannot physically install without Phase 2.B) **and** `dependency_guard_enabled=true` (nothing to auto-install otherwise). |
+| `autoinstall_package_manager` | `String` | `"auto"` | `"auto"` (default) probes the project root for a lockfile (`bun.lock` / `bun.lockb` → bun, `pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm) and falls back to `bun` when no lockfile is present. Explicit overrides: `"bun"`, `"npm"`, `"pnpm"`, `"yarn"`. Any other value is treated as `"auto"`. |
+
+### §19.3 Retry-budget invariant
+
+Phase 2.C preserves the shared-budget contract established by
+Phase 1.C, Phase 1.B, and §V.3:
+
+* **Resolved** (install ok + re-check clean) → **0 slots**
+  consumed. The controller falls through to the compiler gate
+  with the original envelope, in the same iteration of the
+  `for attempt in 0..max_attempts` loop.
+* **NotResolved** (any other terminal state — disabled,
+  execute_disabled, no_missing, empty_after_sanitize, refused,
+  blocked, user_denied, confirm_timed_out, execution_error,
+  install_failed, still_missing_after_install, recheck_error)
+  → **1 slot** consumed. The controller emits
+  `dependency.retry` with a new `autoinstall_reason` field, swaps
+  in the reprompt, and `continue`s to the next iteration.
+
+This keeps a hostile / buggy install path from looping forever:
+the same `max_compile_retries` ceiling that bounded Phase 1.C
+still bounds Phase 2.C.
+
+### §19.4 Command synthesis & determinism
+
+[`autoinstall::synthesise_install_cmd`] is a pure function. The
+package list is **de-duplicated + alphabetically sorted** before
+rendering so two calls with the same logical miss set produce
+byte-identical output regardless of the upstream iteration
+order. Stable output matters for:
+
+* security classifier `matched_rule` / telemetry stability;
+* prefix-based `cmd_allow_list` matching (Phase 2.B allow-list);
+* confirm-modal caching of prior user approvals.
+
+Subcommand map:
+`bun → bun add` / `npm → npm install` / `pnpm → pnpm add` /
+`yarn → yarn add`.
+
+**Quoting.** Names are whitelisted against the character set
+`[A-Za-z0-9@/._+-]` with no leading `-`. Anything containing
+whitespace, quotes, shell metacharacters, or a `-` prefix is
+**dropped silently**, and an empty sanitised list becomes an
+empty command (which the orchestrator treats as
+`Skipped { reason: "empty_after_sanitize" }`). Defence-in-depth:
+the dependency guard already normalises specifiers to package
+roots, but we never pass unsanitised input to the shell.
+
+### §19.5 Package-manager resolution
+
+[`autoinstall::resolve_package_manager`] precedence:
+
+1. Explicit setting (`"bun"` / `"npm"` / `"pnpm"` / `"yarn"`)
+   wins verbatim. User intent beats detection.
+2. Otherwise probe lockfiles via
+   [`autoinstall::detect_package_manager`] in the order
+   **bun → pnpm → yarn → npm**. The bun-first ordering
+   matters for projects mid-migration that still carry a stale
+   `package-lock.json` alongside a fresh `bun.lock`.
+3. If the probe returns `None`, fall back to
+   `default_package_manager()` = `Bun`, matching the repo-level
+   Bun-first convention documented in
+   [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md).
+
+### §19.6 Events (new in §19)
+
+All emitted with `role="autoinstall"` under the same `ai:step`
+channel the rest of the pipeline uses.
+
+| label | status | when |
+| --- | --- | --- |
+| `autoinstall.skipped` | `"done"` | Pre-flight skip. `reason` ∈ {`"disabled"`, `"execute_disabled"`, `"no_missing"`, `"empty_after_sanitize"`, any `ExecutionResult::reason` when the gate returned `Skipped`}. |
+| `autoinstall.attempting` | `"running"` | Command synthesised, about to hand to `run_cmd_gate::execute_run_cmd`. |
+| `autoinstall.ok` | `"done"` | Child exited with code 0. Emitted *before* the guard re-check. |
+| `autoinstall.resolved` | `"done"` | Re-check came back `Ok` / `Skipped` / `Warned`. Fix-forward win. |
+| `autoinstall.ok_but_unresolved` | `"warning"` | Exit 0 but the guard still sees missing specifiers (e.g. the model asked for a package that doesn't exist on the registry). |
+| `autoinstall.failed` | `"failed"` | `Executed` status with non-zero exit. Carries `stderr_tail`. |
+| `autoinstall.refused` | `"blocked"` | Classifier flagged the synthesised command as dangerous. Not expected in practice for `bun add` / `npm install`; emitted as a safety net. |
+| `autoinstall.blocked` | `"blocked"` | `warning_mode=block` blocked the install. |
+| `autoinstall.user_denied` | `"skipped"` | User clicked Deny in the confirm modal. |
+| `autoinstall.confirm_timed_out` | `"skipped"` | Confirm modal timed out or was cancelled. |
+| `autoinstall.error` | `"error"` | Infra-level failure (spawn error, invalid root, or guard re-check error). |
+
+The subsequent `dependency.retry` event (emitted by the
+controller on the `NotResolved` branch) grows a new
+`autoinstall_reason` field so UI consumers can tell
+*retry-after-failed-install* from *retry-after-disabled-gate*
+without rebuilding it from the event stream.
+
+### §19.7 Tests (14 new in PR-L, all pure)
+
+All in [`autoinstall.rs`]'s `tests` module; no network, no
+`Command::spawn`, no Tauri harness required:
+
+`PackageManager::parse`:
+- `parse_accepts_canonical_lowercase`
+- `parse_is_case_insensitive_and_trims`
+- `parse_rejects_auto_empty_and_unknown`
+
+`detect_package_manager` — lockfile probe:
+- `detect_bun_lock_text`
+- `detect_bun_lockb_binary`
+- `detect_pnpm_lock`
+- `detect_yarn_lock`
+- `detect_npm_lock`
+- `detect_none_when_no_lockfile`
+- `detect_bun_wins_over_stale_package_lock`
+
+`resolve_package_manager` — setting + probe + fallback:
+- `resolve_explicit_setting_wins_over_lockfile`
+- `resolve_auto_uses_lockfile`
+- `resolve_auto_with_no_lockfile_falls_back_to_bun`
+- `resolve_unknown_setting_is_treated_as_auto`
+
+`synthesise_install_cmd` — determinism + quoting:
+- `synthesise_bun_uses_add_subcommand`
+- `synthesise_npm_uses_install_subcommand`
+- `synthesise_pnpm_uses_add_subcommand`
+- `synthesise_yarn_uses_add_subcommand`
+- `synthesise_sorts_and_dedupes`
+- `synthesise_handles_scoped_packages_unquoted`
+- `synthesise_drops_packages_with_shell_metacharacters`
+- `synthesise_drops_flag_shaped_tokens`
+- `synthesise_empty_input_yields_empty_output`
+- `synthesise_non_ascii_names_are_rejected`
+
+Total suite: **191/191** passing after PR-L (167 pre-L + 24 new).
+The orchestrator [`try_fix_forward`] is exercised end-to-end in
+production paths but not directly unit-tested in PR-L — it requires
+a full `AppHandle` + `AppState` + sandbox setup that belongs in an
+integration harness. Every pure input into it (detection,
+synthesis, sanitisation, manager resolution) is covered by the
+unit tests above.
+
+### §19.8 Why opt-in (default `false`)
+
+Same three reasons [§V.3 is opt-in](#§v3-opt-in-defaults), plus a
+new one specific to installs:
+
+1. **Phase 2.B is itself opt-in.** An auto-install that cannot
+   physically run until the user flips
+   `security_gate_execute_enabled` would be theatre.
+2. **Irreversible-ish side effects.** `bun add` modifies
+   `package.json` and lockfiles. Users must consciously accept
+   that the controller can now mutate dependency manifests on
+   their behalf.
+3. **Network egress.** Installs fetch from the public registry.
+   Sandboxed / air-gapped environments must opt in (or leave the
+   feature off).
+4. **Registry drift.** A package name the model invented may
+   exist on the registry but not be what the user wanted. Opt-in
+   keeps that failure mode behind a toggle instead of a default.
+
+### §19.9 Deferred (explicitly not in PR-L)
+
+* **Per-envelope dev-vs-runtime split.** Everything installs as
+  a regular dependency. `--save-dev` heuristics belong in a
+  future PR once we have signal on which misses originate from
+  test files vs. runtime imports.
+* **Monorepo targeting.** The command runs from the project root
+  and trusts the detected manager to find the right workspace.
+  Workspace-aware installs (e.g. `bun add -w ...` /
+  `pnpm -F pkg add`) are deferred.
+* **Non-Node ecosystems.** Python (`pip`), Rust (`cargo add`),
+  Go (`go get`) are out of scope for Phase 2.C. The classifier
+  already tags them as Warning; wiring is a follow-up.
+* **UI surface.** `autoinstall.*` events fly over the existing
+  `ai:step` channel; §VI.2/§VI.3 will render them (and the
+  confirm modal for WARNING installs is already in production
+  from Phase 2.B).
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*
