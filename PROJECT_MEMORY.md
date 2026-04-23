@@ -2499,5 +2499,182 @@ Informational-only review notes (no code change, reply-only):
 
 ---
 
+## §18. OC-Titan §V.3 — runtime validation (exit-code + stderr reprompt)
+
+Phase §V.3 closes the self-healing loop that began with the compiler
+gate (§14) and the dependency guard (§15). With Phase 2.B (§17) now
+surfacing an [`ExecutionResult`] on successful `run_cmd` dispatch,
+§V.3 consumes `exit_code` + `stderr_tail` + `stdout_tail` and, on a
+non-zero exit, feeds them back to the model as a repair prompt —
+exactly the same shape as the compiler-gate reprompt, but wired
+*after* execution rather than *before* it.
+
+The entire layer is **deterministic** and **side-effect-free**. It
+makes one pure policy call (`evaluate`) and one pure string-builder
+call (`build_reprompt`); all state mutation, retry budgeting, and
+telemetry live in the controller.
+
+### §18.1 Module map (new file)
+
+- **`desktop/src-tauri/src/runtime_validation.rs`** (~420 LoC,
+  12 unit tests)
+  - `RuntimeOutcome { Ok | Errors | Skipped }` — the tri-state
+    result of policy evaluation.
+  - `evaluate(exec: Option<&ExecutionResult>, enabled: bool)
+     -> RuntimeOutcome` — pure, no I/O. Returns
+    `Skipped { reason: "disabled" }` when the toggle is off,
+    `Skipped { reason: "no_execution" }` when Phase 2.B never
+    dispatched (no `run_cmd`, or `security_gate_execute_enabled`
+    was false), and a stable `Skipped { reason: … }` for every
+    non-`Executed` terminal status (refused, blocked, denied,
+    timed-out, gate-skipped).
+  - `build_reprompt(original_request, exit_code, stderr_tail,
+     stdout_tail)` — formats a Claude-friendly repair prompt that
+    pins the failed command's exit code, stderr tail, and stdout
+    tail inside a fenced block, then re-asks the original request.
+  - `status_to_reason(ExecutionStatus)` — pinned string table for
+    the `Skipped { reason }` tag. Exposed as `pub(crate)` so the
+    controller and tests both reference the same strings.
+
+### §18.2 Outcome truth table
+
+| `enabled` | `execution`                   | `status`          | `exit_code` | `RuntimeOutcome`                         |
+|-----------|-------------------------------|-------------------|-------------|------------------------------------------|
+| `false`   | *any*                         | *any*             | *any*       | `Skipped { reason: "disabled" }`         |
+| `true`    | `None`                        | *n/a*             | *n/a*       | `Skipped { reason: "no_execution" }`     |
+| `true`    | `Some(exec)`                  | `RefusedDangerous`| *any*       | `Skipped { reason: "refused_dangerous"}` |
+| `true`    | `Some(exec)`                  | `BlockedByPolicy` | *any*       | `Skipped { reason: "blocked_by_policy"}` |
+| `true`    | `Some(exec)`                  | `UserDenied`      | *any*       | `Skipped { reason: "user_denied" }`      |
+| `true`    | `Some(exec)`                  | `ConfirmTimedOut` | *any*       | `Skipped { reason: "confirm_timed_out"}` |
+| `true`    | `Some(exec)`                  | `Skipped`         | *any*       | `Skipped { reason: "gate_skipped" }`     |
+| `true`    | `Some(exec)`                  | `Executed`        | `0`         | `Ok { exit_code: 0, duration_ms }`       |
+| `true`    | `Some(exec)`                  | `Executed`        | `!= 0`      | `Errors { exit_code, tails, duration_ms}`|
+
+**Key invariant:** policy refusals (Dangerous refused, Block,
+UserDenied) **never** burn a retry slot. Only a genuine
+`Executed` + non-zero-exit path consumes the shared
+`max_compile_retries` budget.
+
+### §18.3 Lifecycle inside `run_codegen_envelope`
+
+The retry loop that the compiler gate (§14) and dependency guard
+(§15) already share was refactored to keep **apply/execute/validate
+inside the loop** so §V.3 can reprompt on runtime failure without
+duplicating the apply step. The effective order per attempt:
+
+1. Codegen envelope turn (ai call + parse).
+2. Dependency guard (§15) — may `continue` on `GuardOutcome::Missing`
+   (consumes a slot).
+3. Compiler gate (§14) — may `continue` on `CompileOutcome::Errors`
+   (consumes a slot).
+4. **Promote envelope**: `apply_codegen_envelope` writes the files
+   through the `fs_ops` sandbox.
+5. Security classifier (§16) emits `security.classified`.
+6. If `security_gate_execute_enabled`, `run_cmd_gate::execute_run_cmd`
+   runs and populates `AppliedEnvelope.execution`.
+7. **§V.3 evaluate** consumes `result.execution` and the new
+   `runtime_validation_enabled` flag.
+   - `Ok | Skipped` → emit the corresponding step event, store
+     the applied result, `break` out of the loop.
+   - `Errors` → emit `runtime.errors`; if this is the last attempt
+     emit `runtime.exhausted` and `return Err`; otherwise emit
+     `runtime.retry`, rebuild `current_request` via
+     `build_reprompt`, and fall through to the next iteration.
+
+After the loop, the applied result is returned. If somehow every
+slot is consumed without a non-error outcome, the final error
+message comes from the last gate that ran (compiler or runtime).
+
+### §18.4 Shared retry budget
+
+`max_compile_retries` is **one** pool, not three. Every miss
+(`dependency.missing`, `compiler.errors`, `runtime.errors`) burns
+exactly one slot. This keeps the worst-case LLM round-trip count
+bounded and predictable regardless of which gate fails. Skipped
+outcomes (disabled gate, unsupported language, no `run_cmd`,
+policy refusal) do **not** burn slots.
+
+### §18.5 New `ai:step` events (role = `"runtime"`)
+
+All five events carry `attempt` (zero-indexed) so the UI can align
+them with the compiler / guard streams.
+
+| label               | status     | fields                                                                                  |
+|---------------------|------------|-----------------------------------------------------------------------------------------|
+| `runtime.ok`        | `"done"`   | `exit_code`, `duration_ms`                                                              |
+| `runtime.errors`    | `"failed"` | `exit_code`, `duration_ms`, `stderr_tail`, `stdout_tail`                                |
+| `runtime.retry`     | `"running"`| `attempt` (next), `max_attempts`                                                        |
+| `runtime.skipped`   | `"skipped"`| `reason` (one of: `disabled` / `no_execution` / `refused_dangerous` / `blocked_by_policy` / `user_denied` / `confirm_timed_out` / `gate_skipped`) |
+| `runtime.exhausted` | `"failed"` | `exit_code`, `max_attempts`                                                             |
+
+`terminal:output` / `terminal:done` continue to come from
+`tools::run_cmd_impl` unchanged — §V.3 does not duplicate them.
+
+### §18.6 Settings (one new field, `#[serde(default)]`)
+
+- `runtime_validation_enabled: bool` (default **`false`**) — opt-in.
+  Gated on `security_gate_execute_enabled=true` to have any effect
+  (nothing runs → nothing to validate); toggling `runtime_validation_enabled`
+  on without execution enabled is a no-op.
+
+All existing `Settings` defaults continue to deserialize cleanly,
+so this PR is backward-compatible with every persisted settings
+file shipped since PR-A.
+
+### §18.7 Tests (`cargo test --lib runtime_validation`, 12 new)
+
+- `evaluate_returns_skipped_when_disabled`
+- `evaluate_returns_skipped_when_no_execution`
+- `evaluate_returns_skipped_for_refused_dangerous`
+- `evaluate_returns_skipped_for_blocked_by_policy`
+- `evaluate_returns_skipped_for_user_denied`
+- `evaluate_returns_skipped_for_confirm_timed_out`
+- `evaluate_returns_skipped_for_gate_skipped`
+- `evaluate_returns_ok_on_zero_exit`
+- `evaluate_returns_errors_on_nonzero_exit`
+- `build_reprompt_includes_exit_code_and_tails`
+- `build_reprompt_is_utf8_safe_with_emoji_tails`
+- `build_reprompt_preserves_original_request`
+
+Total after PR-J: **167 passed** (155 prior + 12 new, includes a
+couple of incidental additions discovered while refactoring the
+controller loop). Zero failures, zero ignored.
+
+### §18.8 Deliberately deferred (not in PR-J)
+
+- **Phase 2.C — auto-install** (V6 §I.6 second half): synthesise
+  `bun add <pkgs>` / `npm install <pkgs>` after
+  `GuardOutcome::Missing`, route through §16 classifier +
+  §17 executor. Needs PR-J merged so the classifier→executor→
+  validator triangle is stable before layering auto-install on top.
+- **§VI.2 / §VI.3 UI tiers** — `runtime.*` events ship with stable
+  labels + statuses, but the React renderer for ThinkingBlock /
+  FinalAnswer / SystemAction is still TODO. The events are
+  render-agnostic today.
+- **Multi-command runtime validation** — current scope is the
+  single `run_cmd` emitted by the codegen envelope. Multi-command
+  sequences are out of scope until Phase 2.C introduces an explicit
+  command queue.
+
+### §18.9 Why §V.3 is opt-in (default `false`)
+
+Three reasons, in decreasing order of importance:
+
+1. **Phase 2.B is already opt-in.** Until users flip
+   `security_gate_execute_enabled=true`, no `run_cmd` ever runs,
+   so there's nothing for §V.3 to validate. Shipping §V.3 as
+   opt-out would be theatre.
+2. **Retry budget coupling.** §V.3 shares
+   `max_compile_retries` with the compiler gate + dependency
+   guard. Users with custom budgets should consciously opt into
+   the extra pressure runtime errors place on that budget.
+3. **Noise on false failures.** A `run_cmd` that exits non-zero
+   for benign reasons (test suite that reports a warning, a CLI
+   that uses exit 1 for `--help`) would silently consume retries.
+   Opt-in keeps this off until the user knows their `run_cmd`
+   contract.
+
+---
+
 *If something here is wrong or incomplete, fix it in-place rather than
 adding a "TODO" note. This file is only useful as long as it's true.*

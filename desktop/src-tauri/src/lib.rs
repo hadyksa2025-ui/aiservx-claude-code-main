@@ -29,6 +29,7 @@ mod fs_ops;
 mod memory;
 mod project_scan;
 mod run_cmd_gate;
+mod runtime_validation;
 mod security_gate;
 mod settings;
 mod tasks;
