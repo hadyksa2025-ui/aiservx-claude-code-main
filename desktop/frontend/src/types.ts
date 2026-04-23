@@ -121,6 +121,15 @@ export type Settings = {
    * dropped. Clamped at 2 by the backend.
    */
   context_compaction_keep_last: number;
+  /**
+   * OC-Titan §VI.2/§VI.3 test-mode gates. All three default to false
+   * on the backend (`#[serde(default)]`) so they are optional on the
+   * frontend type. When the user flips the dev-mode toggle, the UI
+   * sets all three to true in a single `save_settings` call.
+   */
+  autoinstall_enabled?: boolean;
+  security_gate_execute_enabled?: boolean;
+  runtime_validation_enabled?: boolean;
 };
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "skipped";
@@ -272,6 +281,75 @@ export type StepEvent = {
   /** Concrete model identifier used on the wire (e.g. `"openrouter/auto"`). */
   model?: string;
 };
+
+/**
+ * OC-Titan self-healing pipeline roles (§VI.2 / §VI.3). These are
+ * **disjoint** from the legacy `AgentRole` union (`planner` /
+ * `executor` / `reviewer`) — the backend multiplexes both families of
+ * events onto the same `ai:step` channel, and the frontend
+ * discriminates by role membership.
+ *
+ * Emitted from:
+ * - `controller.rs`  — guard / compiler / execution / runtime
+ * - `autoinstall.rs` — autoinstall
+ * - `run_cmd_gate.rs`— execution (run_cmd.policy)
+ * - `ai.rs`          — codegen envelope lifecycle (role="executor",
+ *                       covered by the legacy channel)
+ */
+export type PipelineRole =
+  | "guard"
+  | "compiler"
+  | "execution"
+  | "runtime"
+  | "autoinstall"
+  | "security";
+
+export function isPipelineRole(role: unknown): role is PipelineRole {
+  return (
+    role === "guard" ||
+    role === "compiler" ||
+    role === "execution" ||
+    role === "runtime" ||
+    role === "autoinstall" ||
+    role === "security"
+  );
+}
+
+/** Status tags the Rust emitters use on `ai:step` payloads. */
+export type PipelineStepStatus = "running" | "done" | "failed" | "warning";
+
+/**
+ * Discriminated subset of `ai:step` payloads emitted by the OC-Titan
+ * pipeline (dependency guard → compiler gate → autoinstall →
+ * execution → runtime validation). Intentionally permissive on
+ * extras — the frontend only needs `{role, label, status, attempt?}`
+ * for the tiered renderer; any extra fields are preserved as-is so
+ * future backend additions don't require a frontend release.
+ */
+export type PipelineStepEvent = {
+  role: PipelineRole;
+  label: string;
+  status: PipelineStepStatus;
+  attempt?: number;
+  reason?: string;
+  missing?: string[];
+  exit_code?: number;
+  class?: "safe" | "warning" | "dangerous";
+  [extra: string]: unknown;
+};
+
+/**
+ * Six-state TaskPanel state machine driven by the pipeline event
+ * stream. The transition function lives in `store.ts` and is purely
+ * event-driven — no timers, no client-side retry counters.
+ */
+export type PipelinePhase =
+  | "idle"
+  | "running"
+  | "waiting_confirm"
+  | "retrying"
+  | "completed"
+  | "failed";
 
 export type ConfirmRequest = {
   id: string;

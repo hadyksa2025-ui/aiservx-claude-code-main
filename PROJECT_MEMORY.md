@@ -2956,6 +2956,218 @@ No behavioural change is visible when `autoinstall_enabled` is
 `false` (the default). The fix matters only for users who have
 opted into the full self-healing pipeline.
 
+## §20. OC-Titan §VI.2 / §VI.3 — UI tiers + TaskPanel state machine
+
+Shipped in **PR-N** on top of PR-M. PR-N is a **frontend-only**
+change — it contains no Rust modifications. It is a strict thin
+renderer over the `ai:step` events already emitted by the Phase
+1.A → 2.C backend pipeline (dependency guard, compiler gate,
+security classifier, execution engine, runtime validation,
+fix-forward auto-install).
+
+### §20.1 Goals and non-goals
+
+* **Goal:** expose the full self-healing loop
+  (`dependency.missing` → `autoinstall.*` → `compiler.*` →
+  `execution.run_cmd.*` → `runtime.*` → envelope apply) to the
+  user without requiring them to read logs or hand-edit three
+  separate opt-in flags.
+* **Goal:** keep the frontend a pure projection of backend
+  events. No business logic, no policy decisions, no
+  client-side derivation of pipeline outcomes.
+* **Non-goal:** feature-complete "pipeline dashboard". The UI
+  is a thin strip that sits next to the existing chat transcript
+  and the existing TaskPanel; it is not a replacement for either.
+* **Non-goal:** extra backend events. Everything rendered in
+  §20 is already emitted by the Phase 1 / 2 / §V.3 modules.
+
+### §20.2 Event catalog → UI tier mapping
+
+The pipeline slice consumes six `role` values and projects each
+one onto exactly one of two UI tiers. Tier 1 (the final answer
+bubble) is intentionally *not* a pipeline tier — it is already
+owned by the existing chat transcript via `Chat.tsx`.
+
+| Role           | Tier     | Renderer               | Examples                                                   |
+|----------------|----------|------------------------|------------------------------------------------------------|
+| `guard`        | Tier 2   | `PipelineMessageList`  | `dependency.missing`, `dependency.ok`, `dependency.retry`  |
+| `compiler`     | Tier 2   | `PipelineMessageList`  | `compiler.ok`, `compiler.errors`, `compiler.retry`         |
+| `security`     | Tier 2   | `PipelineMessageList`  | `warning.bun_install`, `dangerous.rm_rf`, …                |
+| `autoinstall`  | Tier 3   | `SystemAction` pill    | `autoinstall.attempting`, `autoinstall.ok`, `.failed`, …   |
+| `execution`    | Tier 3   | `SystemAction` pill    | `run_cmd.started`, `run_cmd.completed`, `.confirmation`, … |
+| `runtime`      | Tier 3   | `SystemAction` pill    | `runtime.ok`, `runtime.errors`, `runtime.skipped`          |
+
+Type guard: `isPipelineRole(role)` in `types.ts`. Anything outside
+this set keeps flowing through the legacy `pushEvent` path in
+`App.tsx`, which preserves the existing planner / executor /
+reviewer bubble behaviour.
+
+### §20.3 Pipeline store slice (`store.ts`)
+
+Added to the Zustand `useAppStore`:
+
+```
+pipelineEvents: PipelineStepEvent[];   // ring-buffered, cap = PIPELINE_EVENTS_CAP (200)
+pipelinePhase: PipelinePhase;          // six states; see §20.4
+pipelineAttempt: number;               // latest `attempt` seen on any event
+pipelineLastLabel: string | null;      // latest `label` seen (for the phase chip)
+devMode: boolean;                      // local-only, localStorage-backed
+```
+
+Actions:
+
+* `pushPipelineEvent(e)` — ring-buffers the event, advances
+  `pipelinePhase` via `nextPipelinePhase()`, updates
+  `pipelineAttempt` / `pipelineLastLabel`.
+* `resetPipeline()` — clears all four pipeline fields to their
+  initial values. Called at the **start** of a new turn
+  (`Chat.send()`, `TaskPanel.startGoal()`), not in response to
+  the first event. This avoids cross-turn event mixing when a
+  previous turn's terminal event lands late.
+* `setDevMode(v)` — persists to `localStorage` under key
+  `"oc-titan:dev-mode"` and updates in-memory state.
+
+### §20.4 TaskPanel state machine — precedence and runtime guard
+
+`nextPipelinePhase(current, event) -> PipelinePhase` is a pure
+function with **explicit precedence**. It classifies the incoming
+event at each priority level and returns the highest matching one.
+The order is:
+
+```
+failed > completed > waiting_confirm > retrying > running > hold-current
+```
+
+This matters when two events arrive close together. For example,
+`execution.run_cmd.started` (running) followed immediately by
+`execution.run_cmd.confirmation` (waiting_confirm) must leave the
+UI in `waiting_confirm`, not in `running`.
+
+Terminal-failure mapping (`failed`):
+
+* `*.exhausted` from any role (retry budget drained by guard /
+  compiler / runtime).
+* `execution.run_cmd.refused` / `.blocked` / `.user_denied`.
+* `autoinstall.refused` / `.blocked` / `.user_denied`.
+* Any event with `status === "failed"` that is not also a
+  retry-classified one above.
+
+**Runtime-guarded completion (`completed`):**
+
+> `completed` fires **only** on `runtime.ok` or `runtime.skipped`.
+> It *never* fires on `compiler.ok` alone.
+
+This is intentional. If `runtime_validation_enabled` is on, a
+`compiler.ok` will be followed by an `execution.*` step and
+then a `runtime.*` terminal event; declaring success on
+`compiler.ok` alone would let the UI claim completion and *then*
+reveal a `runtime.errors` afterwards, which is user-hostile. The
+backend always emits either `runtime.ok` on success or
+`runtime.skipped` when runtime validation is disabled / was not
+reached — the UI consumes both as terminal success.
+
+Confirmation-pending (`waiting_confirm`):
+`execution.run_cmd.confirmation`, `autoinstall.attempting` when a
+confirmation modal is pending.
+
+Retrying (`retrying`): `*.retry` on any role,
+`autoinstall.failed` (each fallback consumes one retry slot).
+
+Running (`running`): any event whose `status === "running"` that
+wasn't already claimed by a higher priority level.
+
+Once `failed` or `completed` has been entered during a turn the
+phase sticks — only `resetPipeline()` at the start of the next
+turn can move it back to `idle`.
+
+### §20.5 Dev-mode toggle (Settings)
+
+A single checkbox in `SettingsModal` flips the three opt-in
+backend gates together:
+
+* `security_gate_execute_enabled` (Phase 2.B)
+* `runtime_validation_enabled` (§V.3)
+* `autoinstall_enabled` (Phase 2.C)
+
+`dependency_guard_enabled` is **not** wired to the dev-mode
+toggle — it is default-on and must remain independently
+configurable.
+
+Persistence: the toggle state itself is stored in `localStorage`
+under `"oc-titan:dev-mode"`. The three backend flags are only
+persisted when the user hits *Save* (they go through the normal
+`api.saveSettings` round-trip). On Settings-modal open, if
+`devMode === true` in the store, the three flags are pre-populated
+to `true` in the form — restoring the user's previous intent
+without overwriting other saved fields.
+
+The checkbox exposes the current values via a `title` attribute
+and a subdued caption beneath it:
+
+```
+execution: ON · runtime: ON · autoinstall: ON · dependency_guard: default
+```
+
+This makes the compound behaviour explicit instead of leaving it
+as a mystery toggle.
+
+### §20.6 App.tsx event routing
+
+A second `onEvent<Record<string, unknown>>("ai:step", …)` listener
+sits next to the existing `StepEvent` listener. It only consumes
+payloads whose `role` passes `isPipelineRole()` **and** whose
+`label` is a string **and** whose `status` is one of
+`running | done | failed | warning`. Anything else is ignored (the
+legacy listener already handled it). This split keeps the legacy
+debug-panel stream intact and makes the pipeline pathway additive.
+
+### §20.7 Component surface
+
+* `src/components/PipelineMessageList.tsx` — thin projector over
+  `pipelineEvents`. Tier-2 rows use a block-level layout with a
+  role chip; tier-3 rows reuse the existing `SystemAction` pill
+  component so autoinstall / execution / runtime micro-events
+  share palette with the rest of the chat tool pills.
+* `src/components/TaskPanel.tsx` — new "pipeline phase" chip
+  under the existing planning chip. Renders only when
+  `pipelinePhase !== "idle"`. Shows the phase, the latest
+  attempt number (if > 0), and the latest event label.
+* `src/components/Settings.tsx` — dev-mode checkbox with tooltip
+  and ON/OFF caption.
+* `src/components/Chat.tsx` — renders `<PipelineMessageList />`
+  beneath the chat transcript and calls `resetPipeline()` at the
+  start of every new turn.
+
+### §20.8 Invariants
+
+* **Frontend has no policy.** The UI never decides whether an
+  event means "success" or "failure" on its own. Every phase
+  transition is either a pattern match on the label or a direct
+  read of `event.status`.
+* **Ring-buffer cap.** `pipelineEvents.length ≤
+  PIPELINE_EVENTS_CAP` (200). Events past the cap are dropped
+  oldest-first.
+* **Sticky terminals.** Once `completed` / `failed` is entered
+  during a turn, it stays until `resetPipeline()`. Late-arriving
+  informational events (e.g. a trailing `runtime.skipped` after
+  `failed`) cannot demote the state.
+* **No new backend events.** PR-N consumes the events emitted
+  by Phase 1.A, 1.B, 1.C, 2.A, 2.B, §V.3, 2.C unchanged.
+* **Dependency guard untouched.** Dev-mode toggles exactly three
+  gates, not four.
+
+### §20.9 What PR-N intentionally does *not* do
+
+* Does **not** migrate `tools::execute_run_cmd_gated` to
+  `run_cmd_gate::execute_run_cmd`. The shim stays until after
+  the first UI pass reveals real behaviour.
+* Does **not** refine `stdout_tail` capture (the non-blocking
+  read improvement from PR-J review). Deferred to the same
+  post-UI cleanup PR.
+* Does **not** add new backend tests. The existing 191 Rust
+  tests cover the pipeline that PR-N merely renders.
+* Does **not** add feature-flags in `Cargo.toml`.
+
 ---
 
 *If something here is wrong or incomplete, fix it in-place rather than

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { useAppStore } from "../store";
 import type { Settings } from "../types";
 
 import openRouterCategorizedModelsCsv from "../../../../OpenRouter_Categorized_Models.csv?raw";
@@ -586,6 +587,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [allowListText, setAllowListText] = useState("");
+  // OC-Titan §VI.2/§VI.3 — dev-mode toggle. Persisted locally (not on
+  // the backend settings blob) so it survives restarts without the
+  // user having to re-accept the "opt-in" gates on every launch.
+  const devMode = useAppStore((st) => st.devMode);
+  const setDevMode = useAppStore((st) => st.setDevMode);
   const [probe, setProbe] = useState<ProbeState>({ kind: "idle" });
   const [orProbe, setOrProbe] = useState<OpenRouterProbeState>({
     kind: "idle",
@@ -650,6 +656,18 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       try {
         const cur = await api.getSettings();
         const merged = { ...DEFAULTS, ...cur };
+        // OC-Titan §VI.2/§VI.3 — if the user previously enabled
+        // dev-mode, surface the three backend gates as ON even when
+        // the persisted backend settings are still at their opt-out
+        // defaults. The flags are only written to disk when the user
+        // hits Save, so this is a pure display reconciliation — it
+        // restores the previous dev-mode intent without losing the
+        // user-saved values for any other field.
+        if (devMode) {
+          merged.autoinstall_enabled = true;
+          merged.security_gate_execute_enabled = true;
+          merged.runtime_validation_enabled = true;
+        }
         setS(merged);
         setAllowListText(merged.cmd_allow_list.join("\n"));
       } catch {
@@ -658,6 +676,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         setLoaded(true);
       }
     })();
+    // devMode is read once on open: the toggle directly mutates `s`
+    // at click-time, so we don't need to re-sync on every change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const save = async () => {
@@ -1167,6 +1188,55 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             />
             Require confirmation for shell commands not in the allow-list
           </label>
+        </div>
+
+        {/*
+         * OC-Titan §VI.2/§VI.3 — dev-mode toggle. Single checkbox that
+         * flips the three opt-in backend gates so the user can see the
+         * full self-healing pipeline (dependency guard → auto-install →
+         * compiler gate → execution → runtime validation) end-to-end
+         * without hand-editing the individual flags. Dependency guard
+         * is intentionally untouched: it is default-on and must not be
+         * tied to the dev-mode toggle.
+         */}
+        <div className="row">
+          <label
+            title={
+              devMode
+                ? "execution: ON · runtime: ON · autoinstall: ON"
+                : "execution: OFF · runtime: OFF · autoinstall: OFF — enable to see the self-healing pipeline end-to-end"
+            }
+          >
+            <input
+              type="checkbox"
+              checked={devMode}
+              onChange={(e) => {
+                const v = e.target.checked;
+                setDevMode(v);
+                setS((cur) => ({
+                  ...cur,
+                  autoinstall_enabled: v,
+                  security_gate_execute_enabled: v,
+                  runtime_validation_enabled: v,
+                }));
+              }}
+              style={{ width: "auto", marginRight: 6 }}
+            />
+            Dev-mode: enable OC-Titan self-healing pipeline (execution +
+            runtime + autoinstall)
+          </label>
+          <div
+            style={{
+              fontSize: 11,
+              color: "var(--muted, #888)",
+              marginTop: 2,
+              marginLeft: 22,
+            }}
+          >
+            execution: {devMode ? "ON" : "OFF"} · runtime:{" "}
+            {devMode ? "ON" : "OFF"} · autoinstall:{" "}
+            {devMode ? "ON" : "OFF"} · dependency_guard: default
+          </div>
         </div>
 
         <div className="row">
