@@ -1472,149 +1472,149 @@ pub async fn run_codegen_envelope(
         } else {
 
             let scratch = match compiler_gate::prepare_scratch(&project_dir, &turn.envelope).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = app.emit(
-                    "ai:step",
-                    json!({
-                        "role": "compiler",
-                        "label": "compiler.scratch_failed",
-                        "status": "failed",
-                        "reason": e,
-                    }),
-                );
-                return Err(format!("compiler gate could not prepare scratch: {e}"));
-            }
-        };
-        let _ = app.emit(
-            "ai:step",
-            json!({
-                "role": "compiler",
-                "label": "compiler.scratch_ready",
-                "status": "running",
-                "attempt": attempt,
-                "uuid": scratch.uuid,
-                "dir": scratch.dir.display().to_string(),
-            }),
-        );
-
-        let project_path = std::path::Path::new(&project_dir);
-        let toolchain_opt = compiler_gate::detect_toolchain(project_path).await;
-
-        if toolchain_opt.is_none() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = app.emit(
+                        "ai:step",
+                        json!({
+                            "role": "compiler",
+                            "label": "compiler.scratch_failed",
+                            "status": "failed",
+                            "reason": e,
+                        }),
+                    );
+                    return Err(format!("compiler gate could not prepare scratch: {e}"));
+                }
+            };
             let _ = app.emit(
                 "ai:step",
                 json!({
                     "role": "compiler",
-                    "label": "compiler.skipped",
-                    "status": "done",
-                    "reason": "no_toolchain",
+                    "label": "compiler.scratch_ready",
+                    "status": "running",
                     "attempt": attempt,
+                    "uuid": scratch.uuid,
+                    "dir": scratch.dir.display().to_string(),
                 }),
             );
-            // Best-effort cleanup, then promote anyway. This matches
-            // the skip_policy contract — the user has no tsc
-            // available, so the gate is a no-op.
-            let _ = scratch.cleanup().await;
-            envelope_for_apply = Some(turn.envelope);
-        } else {
-        let toolchain = toolchain_opt.expect("checked is_none above");
-        let _ = app.emit(
-            "ai:step",
-            json!({
-                "role": "compiler",
-                "label": "compiler.running",
-                "status": "running",
-                "attempt": attempt,
-                "toolchain": toolchain.as_str(),
-                "timeout_secs": tsc_timeout_secs,
-            }),
-        );
 
-        let outcome = compiler_gate::run_tsc(&scratch, toolchain, tsc_timeout_secs).await;
+            let project_path = std::path::Path::new(&project_dir);
+            let toolchain_opt = compiler_gate::detect_toolchain(project_path).await;
 
-        match outcome {
-            CompileOutcome::Ok { .. } => {
+            if toolchain_opt.is_none() {
                 let _ = app.emit(
                     "ai:step",
                     json!({
                         "role": "compiler",
-                        "label": "compiler.ok",
+                        "label": "compiler.skipped",
                         "status": "done",
+                        "reason": "no_toolchain",
                         "attempt": attempt,
-                        "toolchain": toolchain.as_str(),
                     }),
                 );
+                // Best-effort cleanup, then promote anyway. This matches
+                // the skip_policy contract — the user has no tsc
+                // available, so the gate is a no-op.
                 let _ = scratch.cleanup().await;
                 envelope_for_apply = Some(turn.envelope);
-            }
-            CompileOutcome::Timeout {
-                toolchain: tc,
-                after_secs,
-            } => {
+            } else {
+                let toolchain = toolchain_opt.expect("checked is_none above");
                 let _ = app.emit(
                     "ai:step",
                     json!({
                         "role": "compiler",
-                        "label": "compiler.timeout",
-                        "status": "failed",
-                        "attempt": attempt,
-                        "toolchain": tc.as_str(),
-                        "after_secs": after_secs,
-                    }),
-                );
-                let _ = scratch.cleanup().await;
-                return Err(format!(
-                    "compiler gate: `tsc --noEmit` exceeded {after_secs}s timeout on attempt {attempt}"
-                ));
-            }
-            CompileOutcome::Errors {
-                toolchain: tc,
-                mut diagnostics,
-                raw_output,
-            } => {
-                compiler_gate::rewrite_paths_relative(&mut diagnostics, &scratch.uuid);
-                let feedback = compiler_gate::diagnostics_to_feedback(&diagnostics);
-                let _ = app.emit(
-                    "ai:step",
-                    json!({
-                        "role": "compiler",
-                        "label": "compiler.errors",
-                        "status": "failed",
-                        "attempt": attempt,
-                        "toolchain": tc.as_str(),
-                        "diagnostic_count": diagnostics.len(),
-                        "diagnostics": diagnostics,
-                    }),
-                );
-                let _ = scratch.cleanup().await;
-
-                last_diagnostics = Some(feedback.clone());
-                if attempt + 1 >= max_attempts {
-                    warn!(
-                        "compiler gate exhausted retries after {attempt} attempt(s); raw tsc output was: {}",
-                        truncate_for_log(&raw_output)
-                    );
-                    return Err(format!(
-                        "compiler gate: tsc reported {} error(s) after {} attempt(s):\n{feedback}",
-                        diagnostics.len(),
-                        attempt + 1,
-                    ));
-                }
-                let _ = app.emit(
-                    "ai:step",
-                    json!({
-                        "role": "compiler",
-                        "label": "compiler.retry",
+                        "label": "compiler.running",
                         "status": "running",
-                        "attempt": attempt + 1,
-                        "max_attempts": max_attempts,
+                        "attempt": attempt,
+                        "toolchain": toolchain.as_str(),
+                        "timeout_secs": tsc_timeout_secs,
                     }),
                 );
-                current_request = build_compile_feedback_prompt(&original_request, &feedback);
-            }
-        }
-        } // end `else` of `if toolchain_opt.is_none()` — tsc invocation block
+
+                let outcome = compiler_gate::run_tsc(&scratch, toolchain, tsc_timeout_secs).await;
+
+                match outcome {
+                    CompileOutcome::Ok { .. } => {
+                        let _ = app.emit(
+                            "ai:step",
+                            json!({
+                                "role": "compiler",
+                                "label": "compiler.ok",
+                                "status": "done",
+                                "attempt": attempt,
+                                "toolchain": toolchain.as_str(),
+                            }),
+                        );
+                        let _ = scratch.cleanup().await;
+                        envelope_for_apply = Some(turn.envelope);
+                    }
+                    CompileOutcome::Timeout {
+                        toolchain: tc,
+                        after_secs,
+                    } => {
+                        let _ = app.emit(
+                            "ai:step",
+                            json!({
+                                "role": "compiler",
+                                "label": "compiler.timeout",
+                                "status": "failed",
+                                "attempt": attempt,
+                                "toolchain": tc.as_str(),
+                                "after_secs": after_secs,
+                            }),
+                        );
+                        let _ = scratch.cleanup().await;
+                        return Err(format!(
+                            "compiler gate: `tsc --noEmit` exceeded {after_secs}s timeout on attempt {attempt}"
+                        ));
+                    }
+                    CompileOutcome::Errors {
+                        toolchain: tc,
+                        mut diagnostics,
+                        raw_output,
+                    } => {
+                        compiler_gate::rewrite_paths_relative(&mut diagnostics, &scratch.uuid);
+                        let feedback = compiler_gate::diagnostics_to_feedback(&diagnostics);
+                        let _ = app.emit(
+                            "ai:step",
+                            json!({
+                                "role": "compiler",
+                                "label": "compiler.errors",
+                                "status": "failed",
+                                "attempt": attempt,
+                                "toolchain": tc.as_str(),
+                                "diagnostic_count": diagnostics.len(),
+                                "diagnostics": diagnostics,
+                            }),
+                        );
+                        let _ = scratch.cleanup().await;
+
+                        last_diagnostics = Some(feedback.clone());
+                        if attempt + 1 >= max_attempts {
+                            warn!(
+                                "compiler gate exhausted retries after {attempt} attempt(s); raw tsc output was: {}",
+                                truncate_for_log(&raw_output)
+                            );
+                            return Err(format!(
+                                "compiler gate: tsc reported {} error(s) after {} attempt(s):\n{feedback}",
+                                diagnostics.len(),
+                                attempt + 1,
+                            ));
+                        }
+                        let _ = app.emit(
+                            "ai:step",
+                            json!({
+                                "role": "compiler",
+                                "label": "compiler.retry",
+                                "status": "running",
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                            }),
+                        );
+                        current_request = build_compile_feedback_prompt(&original_request, &feedback);
+                    }
+                }
+            } // end `else` of `if toolchain_opt.is_none()` — tsc invocation block
         } // end `else` of `if let Some(reason) = compiler_gate::skip_policy(...)`
 
         // If the compile gate set `envelope_for_apply`, promote the
