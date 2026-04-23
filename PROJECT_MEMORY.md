@@ -2546,7 +2546,7 @@ telemetry live in the controller.
 | `true`    | `Some(exec)`                  | `BlockedByPolicy` | *any*       | `Skipped { reason: "blocked_by_policy"}` |
 | `true`    | `Some(exec)`                  | `UserDenied`      | *any*       | `Skipped { reason: "user_denied" }`      |
 | `true`    | `Some(exec)`                  | `ConfirmTimedOut` | *any*       | `Skipped { reason: "confirm_timed_out"}` |
-| `true`    | `Some(exec)`                  | `Skipped`         | *any*       | `Skipped { reason: "gate_skipped" }`     |
+| `true`    | `Some(exec)`                  | `Skipped`         | *any*       | `Skipped { reason: "execution_skipped"}`|
 | `true`    | `Some(exec)`                  | `Executed`        | `0`         | `Ok { exit_code: 0, duration_ms }`       |
 | `true`    | `Some(exec)`                  | `Executed`        | `!= 0`      | `Errors { exit_code, tails, duration_ms}`|
 
@@ -2604,7 +2604,7 @@ them with the compiler / guard streams.
 | `runtime.ok`        | `"done"`   | `exit_code`, `duration_ms`                                                              |
 | `runtime.errors`    | `"failed"` | `exit_code`, `duration_ms`, `stderr_tail`, `stdout_tail`                                |
 | `runtime.retry`     | `"running"`| `attempt` (next), `max_attempts`                                                        |
-| `runtime.skipped`   | `"skipped"`| `reason` (one of: `disabled` / `no_execution` / `refused_dangerous` / `blocked_by_policy` / `user_denied` / `confirm_timed_out` / `gate_skipped`) |
+| `runtime.skipped`   | `"skipped"`| `reason` (one of: `disabled` / `no_execution` / `refused_dangerous` / `blocked_by_policy` / `user_denied` / `confirm_timed_out` / `execution_skipped`) |
 | `runtime.exhausted` | `"failed"` | `exit_code`, `max_attempts`                                                             |
 
 `terminal:output` / `terminal:done` continue to come from
@@ -2621,24 +2621,31 @@ All existing `Settings` defaults continue to deserialize cleanly,
 so this PR is backward-compatible with every persisted settings
 file shipped since PR-A.
 
-### §18.7 Tests (`cargo test --lib runtime_validation`, 12 new)
+### §18.7 Tests (`cargo test --lib runtime_validation`, 14 new)
 
-- `evaluate_returns_skipped_when_disabled`
-- `evaluate_returns_skipped_when_no_execution`
-- `evaluate_returns_skipped_for_refused_dangerous`
-- `evaluate_returns_skipped_for_blocked_by_policy`
-- `evaluate_returns_skipped_for_user_denied`
-- `evaluate_returns_skipped_for_confirm_timed_out`
-- `evaluate_returns_skipped_for_gate_skipped`
-- `evaluate_returns_ok_on_zero_exit`
-- `evaluate_returns_errors_on_nonzero_exit`
-- `build_reprompt_includes_exit_code_and_tails`
-- `build_reprompt_is_utf8_safe_with_emoji_tails`
-- `build_reprompt_preserves_original_request`
+`evaluate` — outcome matrix covering every `enabled` × `execution`
+× `status` × `exit_code` combination:
 
-Total after PR-J: **167 passed** (155 prior + 12 new, includes a
-couple of incidental additions discovered while refactoring the
-controller loop). Zero failures, zero ignored.
+- `evaluate_disabled_always_skips_even_with_nonzero_exit`
+- `evaluate_no_execution_returns_no_execution_skip`
+- `evaluate_exit_zero_returns_ok`
+- `evaluate_exit_nonzero_returns_errors_with_tails`
+- `evaluate_exit_negative_one_on_executed_still_counts_as_errors`
+- `evaluate_refused_dangerous_skips`
+- `evaluate_blocked_by_policy_skips`
+- `evaluate_user_denied_skips`
+- `evaluate_confirm_timed_out_skips`
+- `evaluate_execution_skipped_skips`
+
+`build_reprompt` — formatting invariants:
+
+- `reprompt_includes_original_request_exit_and_both_tails`
+- `reprompt_renders_empty_tails_as_explicit_marker`
+- `reprompt_treats_whitespace_only_tails_as_empty`
+- `reprompt_is_utf8_safe_with_emoji_and_multibyte_tails`
+
+Total after PR-J: **167 passed** (153 prior + 14 new). Zero
+failures, zero ignored.
 
 ### §18.8 Deliberately deferred (not in PR-J)
 
